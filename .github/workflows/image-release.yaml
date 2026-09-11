@@ -64,6 +64,31 @@ jobs:
           go vet ./...
           go test -count=1 -race ./...
 
+      # PINS.md IS A PROMISE, AND THIS IS THE ONLY THING THAT KEEPS IT. The README tells
+      # a reader that every hash in that table is what the build verifies. What the build
+      # verifies are the ARG defaults in the Dockerfile, and nothing compared the two: a
+      # bumped digest with an unedited table would ship an image whose published
+      # provenance describes different bytes. Documentation nobody checks is documentation
+      # that is eventually false.
+      - name: PINS.md names every pin the Dockerfile enforces
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r value; do
+            grep -qF "$value" images/rl-duckdb/PINS.md || {
+              echo "::error::$value is enforced by the Dockerfile and absent from PINS.md"
+              missing=1
+            }
+          done < <(grep -oE '^[[:space:]]*ARG [A-Z_]+=(sha256:)?[0-9a-f]{64}' images/rl-duckdb/Dockerfile \
+                   | sed -E 's/^[[:space:]]*ARG [A-Z_]+=//')
+          version=$(grep -oE '^[[:space:]]*ARG DUCKDB_VERSION=[0-9.]+' images/rl-duckdb/Dockerfile | head -1 | cut -d= -f2)
+          grep -qF "$version" images/rl-duckdb/PINS.md || {
+            echo "::error::PINS.md does not name DuckDB $version"
+            missing=1
+          }
+          test "$missing" = 0
+          echo "every enforced pin appears in PINS.md, DuckDB ${version}"
+
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
