@@ -1,0 +1,176 @@
+# Build, test, scan, sign and publish rl-duckdb.
+#
+# WHY THIS REPOSITORY. Engine images are the adopted layer of the RunningLake Runtime:
+# upstream bytes, pinned and verified, never patched. ADR 12 in the private repository
+# puts them here because they need no private source and a public repository has the
+# Actions minutes and the GHCR storage that private tiers do not. The platform bundle
+# itself, and our own binaries, are built in runninglake/runninglake; this workflow is a
+# mirror of that repository's image-release.yaml with one image and one architecture.
+#
+# THE DIGEST IS THE POINT OF THE WHOLE JOB. A tag is mutable. The digest printed in the
+# step summary is what runtimes/index.yaml in the private repository records against a
+# train serial (ADR 9), and what the agent hands a sandbox pod. Nothing consumes the tag.
+#
+# linux/amd64 ONLY. The sandbox node pool is amd64 and the conformance corpus is measured
+# on amd64; an arm64 image nobody measured would make the capability table false on it.
+name: image-release
+
+on:
+  push:
+    tags: ['rl-duckdb/v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp and tag the image with (default dev-<sha>)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  # Keyless cosign. No private key exists to leak, rotate or forget; the signature is
+  # bound to this workflow's OIDC identity.
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/runninglake/rl-duckdb
+  # The hard budget from the runtime plan, applied to the UNCOMPRESSED image: the root
+  # filesystem a sandbox node has on disk before the first query can start. The
+  # compressed (registry) size is reported beside it.
+  SIZE_BUDGET_BYTES: "209715200"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # the revision label wants a real sha, not a shallow one
+
+      # The runner's tests run here, in the open, before any image is built. The
+      # Dockerfile runs them again inside the build so an image can never be produced
+      # from a runner that fails them.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: images/rl-duckdb/runner/go.mod
+      - name: Test the runner
+        working-directory: images/rl-duckdb/runner
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::gofmt"; exit 1; }
+          go vet ./...
+          go test -count=1 -race ./...
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp
+        id: stamp
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#rl-duckdb/}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}"          >> "$GITHUB_OUTPUT"
+          echo "built=$(date -u +%FT%TZ)"    >> "$GITHUB_OUTPUT"
+          echo "version ${version}"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: images/rl-duckdb
+          file: images/rl-duckdb/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.stamp.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.stamp.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The budget is a correctness gate, not a nicety: the sandbox is a single-use pod,
+      # so image size is paid on every cold node and on every query that lands there.
+      - name: Assert the size budget
+        id: size
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}@${{ steps.build.outputs.digest }}"
+          docker pull -q "$REF" >/dev/null
+          # The uncompressed size is the flattened root filesystem, measured by exporting
+          # it. `docker image inspect .Size` is not that: under the containerd image store
+          # it adds the compressed blobs to the unpacked layers and reads a third larger.
+          CONTAINER="$(docker create "$REF")"
+          UNCOMPRESSED="$(docker export "$CONTAINER" | wc -c | tr -d ' ')"
+          docker rm "$CONTAINER" >/dev/null
+          MANIFEST="$(docker buildx imagetools inspect "$REF" --raw \
+            | jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')"
+          COMPRESSED="$(docker buildx imagetools inspect "${IMAGE}@${MANIFEST}" --raw | jq '[.layers[].size] | add')"
+          echo "uncompressed=${UNCOMPRESSED}" >> "$GITHUB_OUTPUT"
+          echo "compressed=${COMPRESSED}"     >> "$GITHUB_OUTPUT"
+          printf 'uncompressed %d bytes (%d MB), compressed %d bytes (%d MB), budget %d bytes\n' \
+            "$UNCOMPRESSED" "$((UNCOMPRESSED / 1048576))" "$COMPRESSED" "$((COMPRESSED / 1048576))" "$SIZE_BUDGET_BYTES"
+          if [ "$UNCOMPRESSED" -ge "$SIZE_BUDGET_BYTES" ]; then
+            echo "::error::rl-duckdb is ${UNCOMPRESSED} bytes uncompressed; the budget is ${SIZE_BUDGET_BYTES}."
+            exit 1
+          fi
+
+      # The image is run the way the pod runs it (uid 65532, read-only root, all
+      # capabilities dropped, /work the only writable path, no credential) against a
+      # local query, a non-query statement, a syntax error, a timeout and an HTTPS
+      # Parquet read, and the Parquet it wrote is read back and checked. Everything
+      # except the runtime class. Details in images/rl-duckdb/smoke/run.sh.
+      - name: Smoke-test the pushed image
+        id: smoke
+        run: |
+          set -euo pipefail
+          images/rl-duckdb/smoke/run.sh "${IMAGE}@${{ steps.build.outputs.digest }}" | tee /tmp/smoke.log
+          echo "metrics=$(sed -n 's/^SMOKE_METRICS=//p' /tmp/smoke.log)" >> "$GITHUB_OUTPUT"
+
+      # SCAN BEFORE SIGNING, NOT AFTER. A signature is an assertion that we stand behind
+      # these bytes; producing one and then discovering the bytes are bad means the
+      # assertion was made before it was earned.
+      - name: Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          # Dated, justified ignores; see images/rl-duckdb/.trivyignore. A finding in a
+          # component no query reaches is still a finding, so it is written down with an
+          # expiry rather than lowering the gate for everyone. ignore-unfixed is not
+          # laxity: a finding with no available fix cannot be actioned by rebuilding.
+          trivyignores: images/rl-duckdb/.trivyignore
+
+      - uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign
+        run: |
+          cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Report the digest
+        run: |
+          {
+            echo "### rl-duckdb ${{ steps.stamp.outputs.version }}"
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "linux/amd64 only. Uncompressed ${{ steps.size.outputs.uncompressed }} bytes, compressed ${{ steps.size.outputs.compressed }} bytes, budget ${SIZE_BUDGET_BYTES}."
+            echo
+            echo "Smoke query \`SELECT count(*) AS n, sum(i) AS s FROM range(10000000) t(i)\` printed:"
+            echo '```'
+            echo "RL_METRICS ${{ steps.smoke.outputs.metrics }}"
+            echo '```'
+            echo "Record the digest against the train serial in \`runtimes/index.yaml\` (private repository, ADR 9)."
+          } >> "$GITHUB_STEP_SUMMARY"

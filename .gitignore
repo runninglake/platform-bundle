@@ -1,0 +1,3 @@
+# Go build output and local scratch
+images/rl-duckdb/runner/rl-duckdb-runner
+*.parquet

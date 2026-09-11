@@ -1,0 +1,7 @@
+# Nothing ignored. The file exists because image-release.yaml points Trivy at
+# images/<image>/.trivyignore, and a missing path is an error.
+#
+# Every line added here carries an expiry (`CVE-XXXX-NNNNN exp:YYYY-MM-DD`). On that date
+# Trivy fails the build again, so the next DuckDB or base bump has to re-evaluate the
+# finding rather than inherit the silence. Add a line only with the component it lives
+# in, why no code path in the sandbox reaches it, and the fixed version.

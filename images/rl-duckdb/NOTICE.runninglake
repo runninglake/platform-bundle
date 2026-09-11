@@ -1,0 +1,27 @@
+rl-duckdb
+=========
+
+This image is based on DuckDB v1.5.5 with 0 RunningLake patches.
+
+Upstream components, unmodified:
+
+  DuckDB CLI v1.5.5             MIT      DuckDB Foundation
+                                         https://github.com/duckdb/duckdb
+  httpfs extension v1.5.5       MIT      DuckDB Foundation
+                                         https://github.com/duckdb/duckdb-httpfs
+  avro extension v1.5.5         MIT      DuckDB Foundation
+                                         https://github.com/duckdb/duckdb-avro
+  iceberg extension v1.5.5      MIT      DuckDB Foundation
+                                         https://github.com/duckdb/duckdb-iceberg
+  json, icu, parquet            MIT      statically linked into the DuckDB CLI upstream
+  gcr.io/distroless/cc-debian12 Apache-2.0 (image tooling); Debian packages under their
+                                         own licences, see /usr/share/doc in the image
+
+RunningLake components:
+
+  rl-duckdb-runner              Apache-2.0  RunningLake
+                                         https://github.com/runninglake/platform-bundle
+
+DuckDB is a trademark of the DuckDB Foundation. This image is not an official DuckDB
+distribution. Every sha256 this image was built from is recorded in
+images/rl-duckdb/PINS.md in the repository above.

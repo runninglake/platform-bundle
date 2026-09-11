@@ -1,0 +1,1 @@
+CREATE TEMP TABLE rl_smoke AS SELECT 1 AS one;
