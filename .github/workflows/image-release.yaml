@@ -111,6 +111,125 @@ jobs:
           echo "built=$(date -u +%FT%TZ)"    >> "$GITHUB_OUTPUT"
           echo "version ${version}"
 
+      # SCAN BEFORE PUSH, NOT AFTER.
+      #
+      # This used to push first and gate second, and the comment under the scan defended
+      # it by saying it scanned before SIGNING. That is true and it is the wrong
+      # invariant. The scan's own argument -- do not assert we stand behind these bytes
+      # before we have earned it -- applies to publication just as much as to the
+      # signature. A registry is not a private staging area: what is pushed there is
+      # resolvable by tag, by anyone, immediately.
+      #
+      # It has already happened in the private repository's copy of this workflow.
+      # rl-agent failed its scan on two CRITICAL findings and the run left a complete,
+      # pullable image in ghcr with no signature, no reported digest, and nothing saying
+      # it had been rejected. That digest was nearly pinned into a release train.
+      #
+      # So the image is built into the runner's own docker daemon and every gate that can
+      # reject it -- size, smoke, scan -- runs against the local image. The push happens
+      # only after all three pass, and a rejected build leaves nothing behind.
+      #
+      # `load: true` costs nothing here because this image is linux/amd64 only (RLR ships
+      # engines single-arch at v1), and the push below reuses the same gha cache, so it
+      # assembles a manifest rather than compiling a second time. `provenance`/`sbom` are
+      # off for the local build only: they are OCI-exporter attestations the docker
+      # exporter cannot carry, and the real push re-enables both.
+      - name: Build for the gates
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: images/rl-duckdb
+          file: images/rl-duckdb/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: rl-duckdb-local:${{ steps.stamp.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.stamp.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The budget is a correctness gate, not a nicety: the sandbox is a single-use pod,
+      # so image size is paid on every cold node and on every query that lands there.
+      #
+      # The gate is on the UNCOMPRESSED size, which is a property of the built image and
+      # needs no registry at all. The compressed size is reported and not gated, so the
+      # one measurement that genuinely needs a manifest moved below the push.
+      - name: Assert the size budget
+        id: size
+        run: |
+          set -euo pipefail
+          REF="rl-duckdb-local:${{ steps.stamp.outputs.version }}"
+          # The uncompressed size is the flattened root filesystem, measured by exporting
+          # it. `docker image inspect .Size` is not that: under the containerd image store
+          # it adds the compressed blobs to the unpacked layers and reads a third larger.
+          CONTAINER="$(docker create "$REF")"
+          UNCOMPRESSED="$(docker export "$CONTAINER" | wc -c | tr -d ' ')"
+          docker rm "$CONTAINER" >/dev/null
+          echo "uncompressed=${UNCOMPRESSED}" >> "$GITHUB_OUTPUT"
+          printf 'uncompressed %d bytes (%d MB), budget %d bytes\n' \
+            "$UNCOMPRESSED" "$((UNCOMPRESSED / 1048576))" "$SIZE_BUDGET_BYTES"
+          if [ "$UNCOMPRESSED" -ge "$SIZE_BUDGET_BYTES" ]; then
+            echo "::error::rl-duckdb is ${UNCOMPRESSED} bytes uncompressed; the budget is ${SIZE_BUDGET_BYTES}."
+            exit 1
+          fi
+
+      # The image is run the way the pod runs it (uid 65532, read-only root, all
+      # capabilities dropped, /work the only writable path, no credential) against a
+      # local query, a non-query statement, a syntax error, a timeout and an HTTPS
+      # Parquet read, and the Parquet it wrote is read back and checked. Everything
+      # except the runtime class. Details in images/rl-duckdb/smoke/run.sh.
+      #
+      # Against the local image, so an engine that cannot answer a query is never
+      # published. docker run does not care whether a reference came from a registry.
+      - name: Smoke-test the image
+        id: smoke
+        run: |
+          set -euo pipefail
+          images/rl-duckdb/smoke/run.sh "rl-duckdb-local:${{ steps.stamp.outputs.version }}" | tee /tmp/smoke.log
+          # A GATE THAT CANNOT TELL "PASSED" FROM "DID NOTHING" IS NOT A GATE.
+          #
+          # This step used to sed SMOKE_METRICS out of the log and stop. If that line
+          # were ever absent -- a renamed marker, an early return, a case loop that
+          # silently covered nothing -- the variable came back empty, the step stayed
+          # green, and the job summary printed an empty metrics line under a heading that
+          # said the image had been smoke-tested. The guard below is the floor: the run
+          # must say every case passed, and it must have run as many cases as run.sh
+          # actually invokes.
+          #
+          # The expected count is derived from the script rather than written here, so
+          # adding a case cannot silently leave this assertion behind.
+          EXPECTED="$(grep -c '^run_case ' images/rl-duckdb/smoke/run.sh)"
+          ACTUAL="$(grep -c '^ok ' /tmp/smoke.log || true)"
+          grep -qx 'smoke: all cases passed' /tmp/smoke.log \
+            || { echo "::error::the smoke run never reported that all cases passed"; exit 1; }
+          if [ "$EXPECTED" -lt 1 ] || [ "$ACTUAL" -ne "$EXPECTED" ]; then
+            echo "::error::smoke exercised ${ACTUAL} cases; run.sh invokes ${EXPECTED}."
+            exit 1
+          fi
+          METRICS="$(sed -n 's/^SMOKE_METRICS=//p' /tmp/smoke.log)"
+          [ -n "$METRICS" ] || { echo "::error::the smoke run printed no SMOKE_METRICS line"; exit 1; }
+          printf '%s' "$METRICS" | jq -e . >/dev/null \
+            || { echo "::error::SMOKE_METRICS is not valid JSON: ${METRICS}"; exit 1; }
+          echo "smoke exercised ${ACTUAL}/${EXPECTED} cases"
+          echo "metrics=${METRICS}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: rl-duckdb-local:${{ steps.stamp.outputs.version }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          # Dated, justified ignores; see images/rl-duckdb/.trivyignore. A finding in a
+          # component no query reaches is still a finding, so it is written down with an
+          # expiry rather than lowering the gate for everyone. ignore-unfixed is not
+          # laxity: a finding with no available fix cannot be actioned by rebuilding.
+          trivyignores: images/rl-duckdb/.trivyignore
+
+      # Every gate has passed. Only now do these bytes become visible to anyone.
       - name: Build and push
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -128,60 +247,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The budget is a correctness gate, not a nicety: the sandbox is a single-use pod,
-      # so image size is paid on every cold node and on every query that lands there.
-      - name: Assert the size budget
-        id: size
+      # A DIGEST COMES FROM A SUCCESSFUL BUILD'S OUTPUT OR IT DOES NOT EXIST.
+      #
+      # An empty or malformed digest must stop here rather than reach `cosign sign` and
+      # fail in a way that leaves something published and unattested. It also means the
+      # summary an operator copies a pin out of reads a value this job produced, never
+      # one resolved from a registry tag.
+      - name: Refuse a digest the build did not produce
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::the build reported no usable digest: '$DIGEST'"; exit 1; }
+          echo "build reported $DIGEST"
+
+      # Reporting only, and the one measurement that genuinely needs the registry: the
+      # compressed layer sizes are what a cold node actually pulls.
+      - name: Record the compressed size
+        id: compressed
         run: |
           set -euo pipefail
           REF="${IMAGE}@${{ steps.build.outputs.digest }}"
-          docker pull -q "$REF" >/dev/null
-          # The uncompressed size is the flattened root filesystem, measured by exporting
-          # it. `docker image inspect .Size` is not that: under the containerd image store
-          # it adds the compressed blobs to the unpacked layers and reads a third larger.
-          CONTAINER="$(docker create "$REF")"
-          UNCOMPRESSED="$(docker export "$CONTAINER" | wc -c | tr -d ' ')"
-          docker rm "$CONTAINER" >/dev/null
           MANIFEST="$(docker buildx imagetools inspect "$REF" --raw \
             | jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')"
           COMPRESSED="$(docker buildx imagetools inspect "${IMAGE}@${MANIFEST}" --raw | jq '[.layers[].size] | add')"
-          echo "uncompressed=${UNCOMPRESSED}" >> "$GITHUB_OUTPUT"
-          echo "compressed=${COMPRESSED}"     >> "$GITHUB_OUTPUT"
-          printf 'uncompressed %d bytes (%d MB), compressed %d bytes (%d MB), budget %d bytes\n' \
-            "$UNCOMPRESSED" "$((UNCOMPRESSED / 1048576))" "$COMPRESSED" "$((COMPRESSED / 1048576))" "$SIZE_BUDGET_BYTES"
-          if [ "$UNCOMPRESSED" -ge "$SIZE_BUDGET_BYTES" ]; then
-            echo "::error::rl-duckdb is ${UNCOMPRESSED} bytes uncompressed; the budget is ${SIZE_BUDGET_BYTES}."
-            exit 1
-          fi
-
-      # The image is run the way the pod runs it (uid 65532, read-only root, all
-      # capabilities dropped, /work the only writable path, no credential) against a
-      # local query, a non-query statement, a syntax error, a timeout and an HTTPS
-      # Parquet read, and the Parquet it wrote is read back and checked. Everything
-      # except the runtime class. Details in images/rl-duckdb/smoke/run.sh.
-      - name: Smoke-test the pushed image
-        id: smoke
-        run: |
-          set -euo pipefail
-          images/rl-duckdb/smoke/run.sh "${IMAGE}@${{ steps.build.outputs.digest }}" | tee /tmp/smoke.log
-          echo "metrics=$(sed -n 's/^SMOKE_METRICS=//p' /tmp/smoke.log)" >> "$GITHUB_OUTPUT"
-
-      # SCAN BEFORE SIGNING, NOT AFTER. A signature is an assertion that we stand behind
-      # these bytes; producing one and then discovering the bytes are bad means the
-      # assertion was made before it was earned.
-      - name: Scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          severity: CRITICAL,HIGH
-          # Dated, justified ignores; see images/rl-duckdb/.trivyignore. A finding in a
-          # component no query reaches is still a finding, so it is written down with an
-          # expiry rather than lowering the gate for everyone. ignore-unfixed is not
-          # laxity: a finding with no available fix cannot be actioned by rebuilding.
-          trivyignores: images/rl-duckdb/.trivyignore
+          echo "compressed=${COMPRESSED}" >> "$GITHUB_OUTPUT"
+          printf 'compressed %d bytes (%d MB)\n' "$COMPRESSED" "$((COMPRESSED / 1048576))"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -196,7 +286,7 @@ jobs:
             echo '```'
             echo "${IMAGE}@${{ steps.build.outputs.digest }}"
             echo '```'
-            echo "linux/amd64 only. Uncompressed ${{ steps.size.outputs.uncompressed }} bytes, compressed ${{ steps.size.outputs.compressed }} bytes, budget ${SIZE_BUDGET_BYTES}."
+            echo "linux/amd64 only. Uncompressed ${{ steps.size.outputs.uncompressed }} bytes, compressed ${{ steps.compressed.outputs.compressed }} bytes, budget ${SIZE_BUDGET_BYTES}."
             echo
             echo "Smoke query \`SELECT count(*) AS n, sum(i) AS s FROM range(10000000) t(i)\` printed:"
             echo '```'
