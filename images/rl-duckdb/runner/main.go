@@ -56,7 +56,62 @@ const (
 	classOOM          = "out_of_memory"
 	classRunnerIO     = "runner_io_error"
 	classInvalidQuery = "invalid_query_file"
+
+	// THE FINER CLASSES THE AGENT HAS ALWAYS ACCEPTED AND NOTHING EVER SENT.
+	//
+	// internal/agent/duckdb's RunnerClasses admits all of these and its own comment says
+	// "the rest of the vocabulary a runner may adopt"; cmd/rl/classes.go already carries
+	// a sentence for each. Until now this runner reported every engine error as
+	// sql_error, so a person who queried a table their project HAD DECLARED was told
+	// "the engine reported an error in the statement" — which points them at their SQL,
+	// and their SQL was fine. Measured on QA 2026-09-18: `SELECT * FROM loop_probe`
+	// against a table in phase ready, ten vCPU-seconds charged, and nothing in the answer
+	// saying the sandbox has no catalog to find it in.
+	//
+	// A class is a word from a list, never a fragment of the engine's message: the
+	// message quotes the statement and can quote row values, which is why it stays in
+	// error.log. Which WORD is chosen is the only thing that crosses.
+	classCatalog    = "catalog_error"
+	classBinder     = "binder_error"
+	classSyntax     = "syntax_error"
+	classIO         = "io_error"
+	classHTTP       = "http_error"
+	classPermission = "permission_denied"
 )
+
+// duckdbErrorClasses maps DuckDB's own error prefixes onto that vocabulary.
+//
+// ORDER MATTERS AND IS NOT ALPHABETICAL. DuckDB prefixes every error with its kind, but
+// some messages mention another kind further in — an "IO Error" while reading a remote
+// file also says "HTTP", for instance — so the first prefix wins and the list is ordered
+// by how specific the kind is. Anything not here stays sql_error, which is what every
+// engine error was before this existed: a token that says "the statement failed" without
+// guessing why.
+var duckdbErrorClasses = []struct {
+	prefix string
+	class  string
+}{
+	{"Catalog Error", classCatalog},
+	{"Binder Error", classBinder},
+	{"Parser Error", classSyntax},
+	{"Permission Error", classPermission},
+	{"HTTP Error", classHTTP},
+	{"IO Error", classIO},
+}
+
+// classifyEngineError reads the kind DuckDB named and returns the matching class.
+//
+// It reads only the HEAD of the log, the same bounded read the out-of-memory check uses:
+// the error log holds the engine's whole complaint, which is customer data, and this
+// function must never need more than the first line of it to name a kind.
+func classifyEngineError(head string) string {
+	for _, c := range duckdbErrorClasses {
+		if strings.Contains(head, c.prefix) {
+			return c.class
+		}
+	}
+	return classSQL
+}
 
 // metrics is the one line of stdout. Field order is the contract's order.
 type metrics struct {
@@ -278,8 +333,15 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 			note("the engine failed before the statement ran (configuration or extension load); its stderr is above")
 			return finish(classRunnerIO, 1)
 		}
-		if strings.Contains(readHead(errorLog, 64<<10), "Out of Memory Error") {
+		head := readHead(errorLog, 64<<10)
+		if strings.Contains(head, "Out of Memory Error") {
 			return finish(classOOM, 1)
+		}
+		// The engine named a kind; say which. Previously every one of these was
+		// sql_error, and "the engine reported an error in the statement" is the least
+		// useful true thing that can be said about a missing table.
+		if c := classifyEngineError(head); c != classSQL {
+			return finish(c, 1)
 		}
 		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
 			note("engine was killed by SIGKILL outside the runner's timeout; presumed the pod memory limit")

@@ -119,8 +119,21 @@ The runner:
    ```
    RL_METRICS {"status":"succeeded","rows_out":1,"bytes_scanned":0,"cpu_core_seconds":0.41,"peak_memory_bytes":97218560,"wall_seconds":0.52,"result_bytes":631,"result_uploaded":true}
    ```
-   `error_class` is present only on failure and is one of `sql_error` (any DuckDB error
-   raised by the statement), `query_timeout`, `out_of_memory` (DuckDB's
+   `error_class` is present only on failure. When DuckDB names the kind of error, the
+   runner says which: `catalog_error` (a table or schema the engine could not find),
+   `binder_error` (a column or function it could not resolve), `syntax_error`,
+   `io_error`, `http_error` and `permission_denied`. `sql_error` remains the answer for
+   any DuckDB error whose kind is not one of those — guessing a kind is worse than
+   declining to, because a wrong class sends a person to look in the wrong place.
+
+   That list is not new to the platform: `internal/agent/duckdb`'s `RunnerClasses` has
+   admitted all of them from the start and `cmd/rl` carries a sentence for each. What was
+   new is a runner that says one. Before this every engine error was `sql_error`, so a
+   person querying a table their project had DECLARED was told "the engine reported an
+   error in the statement" — pointing at their SQL, which was fine; the sandbox simply has
+   no catalog to find the table in.
+
+   The rest: `query_timeout`, `out_of_memory` (DuckDB's
    "Out of Memory Error", or the engine killed by SIGKILL outside the runner's own
    timeout), `runner_io_error` (the runner could not do its own work: work directory,
    result or count file, the engine binary, or the engine failed before the statement
