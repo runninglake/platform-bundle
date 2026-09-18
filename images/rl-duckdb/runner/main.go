@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +58,13 @@ const (
 	classInvalidQuery = "invalid_query_file"
 )
 
+// classResultUpload: the statement ran and the result file exists, but the PUT to the
+// upload URL the agent handed this pod did not return 2xx. The rows are in the emptyDir
+// and die with the pod; the caller sees a failed query rather than a succeeded one with
+// no result, because a "succeeded" whose rows nobody can reach is the misreading this
+// runner exists to refuse.
+const classResultUpload = "result_upload_failed"
+
 // metrics is the one line of stdout. Field order is the contract's order.
 type metrics struct {
 	Status          string  `json:"status"`
@@ -77,6 +86,11 @@ type config struct {
 	timeout     time.Duration
 	duckdb      string
 	initFile    string
+	// uploadURL and uploadHeaders are the presigned PUT the agent minted for this
+	// query's result (ADR 27, decision 6), or empty: a plane that writes no results
+	// hands the pod neither, and that is a supported plane.
+	uploadURL     string
+	uploadHeaders map[string]string
 }
 
 var (
@@ -120,7 +134,82 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		n, _ := strconv.Atoi(v)
 		c.timeout = time.Duration(n) * time.Second
 	}
+	// THE UPLOAD PAIR IS BOTH OR NEITHER, refused at start. The agent sets both together
+	// (internal/agent/duckdb/manifests.go) because the SSE-KMS headers are signed INTO
+	// the URL: a PUT without them is a 403 from S3 after the query has already run and
+	// been charged for. Refusing here turns that into a sentence before any work.
+	u, h := getenv("RL_RESULT_UPLOAD_URL"), getenv("RL_RESULT_UPLOAD_HEADERS")
+	if (u == "") != (h == "") {
+		return c, errors.New("RL_RESULT_UPLOAD_URL and RL_RESULT_UPLOAD_HEADERS must be set together or not at all")
+	}
+	if u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			// The value is never echoed: a presigned URL carries its own authorisation.
+			return c, errors.New("RL_RESULT_UPLOAD_URL is not an https URL")
+		}
+		var hdr map[string]string
+		if err := json.Unmarshal([]byte(h), &hdr); err != nil {
+			return c, fmt.Errorf("RL_RESULT_UPLOAD_HEADERS is not a JSON object of strings: %v", err)
+		}
+		c.uploadURL, c.uploadHeaders = u, hdr
+	}
 	return c, nil
+}
+
+// uploadResult PUTs the result file to the presigned URL, sending the signed headers
+// verbatim. Any response that is not 2xx is a failure: S3 answers 403 SignatureDoesNotMatch
+// to a PUT that dropped a signed header or named a different key, which is the property
+// that stops this pod writing an unencrypted object (measured on the QA plane 2026-09-18).
+//
+// THE URL NEVER REACHES THE ERROR OR THE LOG. It is a bearer credential for one object
+// until it expires, and error.log is read by the agent and may be forwarded.
+func uploadResult(ctx context.Context, cfg config, size int64) error {
+	f, err := os.Open(cfg.resultFile)
+	if err != nil {
+		return fmt.Errorf("open result: %w", err)
+	}
+	defer f.Close()
+	// Bounded on its own, because RL_TIMEOUT_SECONDS may be zero (no engine timeout)
+	// and an upload must still not hang a pod forever.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, cfg.uploadURL, f)
+	if err != nil {
+		return errors.New("build upload request")
+	}
+	req.ContentLength = size
+	for k, v := range cfg.uploadHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// err may embed the URL; keep the class of failure and drop the text.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return fmt.Errorf("upload %s: %s", ue.Op, classifyNetErr(ue))
+		}
+		return errors.New("upload: request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("upload refused: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// classifyNetErr names a transport failure without repeating anything that might carry
+// the URL.
+func classifyNetErr(ue *url.Error) string {
+	switch {
+	case ue.Timeout():
+		return "timed out"
+	case errors.Is(ue.Err, context.DeadlineExceeded), errors.Is(ue.Err, context.Canceled):
+		return "cancelled"
+	default:
+		return "connection failed"
+	}
 }
 
 func main() {
@@ -271,6 +360,15 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	}
 	m.RowsOut = rows
 	m.ResultBytes = fi.Size()
+	// The result leaves the sandbox (ADR 27, decision 6). Only after the file is proven
+	// to exist, so a PUT never sends nothing; and a failed upload FAILS the run, so no
+	// caller is ever told "succeeded" about rows that died with this pod.
+	if cfg.uploadURL != "" {
+		if err := uploadResult(ctx, cfg, fi.Size()); err != nil {
+			note("result upload: %v", err)
+			return finish(classResultUpload, 1)
+		}
+	}
 	return finish("", 0)
 }
 
