@@ -48,6 +48,9 @@ const (
 	// initSentinel is printed by the script after every configuration and LOAD and
 	// before the statement. Its absence on failure means the engine, not the SQL, broke.
 	initSentinel = "RL_INIT_OK"
+	// preludeSentinel follows the control plane's prelude when there is one, so a prelude
+	// that fails is told apart from init (before RL_INIT_OK) and from the statement.
+	preludeSentinel = "RL_PRELUDE_OK"
 
 	// The closed set of error classes. The agent switches on these; add one only with
 	// the agent.
@@ -78,6 +81,13 @@ const (
 	classHTTP       = "http_error"
 	classPermission = "permission_denied"
 )
+
+// classPrelude: the engine ran init, then failed inside the prelude the control plane
+// composed (catalog resolution — today the sample dataset's views over its published
+// location) before the customer's statement ran. The usual cause is a plane whose sandbox
+// cannot reach the published bytes; it is never the statement's fault and never the
+// image's, so it is neither classSQL nor classRunnerIO.
+const classPrelude = "prelude_failed"
 
 // duckdbErrorClasses maps DuckDB's own error prefixes onto that vocabulary.
 //
@@ -146,6 +156,10 @@ type config struct {
 	timeout     time.Duration
 	duckdb      string
 	initFile    string
+	// preludeFile is trusted SQL the control plane composed, run after init and before
+	// the statement, or empty. It is never classified as the statement: it is composed,
+	// not passed through, and the agent writes it under its own ConfigMap key.
+	preludeFile string
 }
 
 var (
@@ -169,6 +183,7 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		duckdb:    or(getenv("RL_DUCKDB_BIN"), "/usr/local/bin/duckdb"),
 		initFile:  or(getenv("RL_INIT_FILE"), "/opt/duckdb/init.sql"),
 	}
+	c.preludeFile = strings.TrimSpace(getenv("RL_PRELUDE_FILE"))
 	c.resultFile = or(getenv("RL_RESULT_FILE"), filepath.Join(c.workDir, "result.parquet"))
 	// THE UPLOAD, WHEN THE AGENT MINTED ONE. A presigned PUT and the headers its
 	// signature covers. No credential reaches this pod — automountServiceAccountToken is
@@ -280,8 +295,21 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 		note("init file: %v", err)
 		return finish(classRunnerIO, 1)
 	}
+	var prelude string
+	if cfg.preludeFile != "" {
+		b, err := os.ReadFile(cfg.preludeFile)
+		if err != nil {
+			note("prelude file: %v", err)
+			return finish(classRunnerIO, 1)
+		}
+		if len(b) > maxPreludeBytes {
+			note("prelude file: %d bytes, more than the %d this runner accepts", len(b), maxPreludeBytes)
+			return finish(classRunnerIO, 1)
+		}
+		prelude = string(b)
+	}
 	countFile := filepath.Join(cfg.workDir, "rowcount.csv")
-	script := composeScript(string(initSQL), cfg, tmpDir, countFile, stmt, kind)
+	script := composeScript(string(initSQL), prelude, cfg, tmpDir, countFile, stmt, kind)
 
 	// The engine's stdout is captured to a file and never forwarded: a non-query
 	// statement can print rows, and the sentinel is read back from here.
@@ -332,6 +360,10 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 		if !initRan(outPath) {
 			note("the engine failed before the statement ran (configuration or extension load); its stderr is above")
 			return finish(classRunnerIO, 1)
+		}
+		if prelude != "" && !sentinelRan(outPath, preludeSentinel) {
+			note("the engine failed inside the control plane's prelude, before the statement ran; the sandbox may not reach the published dataset. Its stderr is above")
+			return finish(classPrelude, 1)
 		}
 		head := readHead(errorLog, 64<<10)
 		if strings.Contains(head, "Out of Memory Error") {
@@ -387,7 +419,7 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 
 // composeScript is the whole conversation with the engine, in order: the image's
 // init.sql, the per-run settings, the lock, the sentinel, then the statement.
-func composeScript(initSQL string, cfg config, tmpDir, countFile, stmt string, kind stmtKind) string {
+func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, stmt string, kind stmtKind) string {
 	var b strings.Builder
 	b.WriteString(initSQL)
 	if !strings.HasSuffix(initSQL, "\n") {
@@ -404,6 +436,19 @@ func composeScript(initSQL string, cfg config, tmpDir, countFile, stmt string, k
 	// directory, or change any other setting: DuckDB refuses with an error.
 	b.WriteString("SET lock_configuration=true;\n")
 	fmt.Fprintf(&b, "SELECT '%s';\n", initSentinel)
+	// THE PRELUDE, AFTER THE LOCK AND AFTER THE INIT SENTINEL. After the lock, so even a
+	// prelude cannot re-enable autoinstall or move the extension directory; after the
+	// sentinel, so a prelude that fails is not mistaken for init failing; and followed by
+	// its own sentinel, so it is not mistaken for the statement failing either. It goes
+	// in whole: it is composed by the control plane, never customer input, and is not
+	// put through singleStatement() — that is what lets it hold several statements.
+	if prelude != "" {
+		b.WriteString(prelude)
+		if !strings.HasSuffix(prelude, "\n") {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "SELECT '%s';\n", preludeSentinel)
+	}
 	switch kind {
 	case kindQuery:
 		fmt.Fprintf(&b, "CREATE TEMP TABLE %s AS\n%s\n;\n", resultTable, stmt)
@@ -644,15 +689,23 @@ func isIdentByte(c byte) bool {
 }
 
 // initRan reports whether the sentinel reached the engine's stdout.
-func initRan(outPath string) bool {
+func initRan(outPath string) bool { return sentinelRan(outPath, initSentinel) }
+
+// sentinelRan is whether the engine printed the given sentinel: whether the script got
+// that far before whatever stopped it.
+func sentinelRan(outPath, sentinel string) bool {
 	for _, line := range strings.Split(readHead(outPath, 64<<10), "\n") {
 		line = strings.Trim(strings.TrimSpace(line), `"`)
-		if line == initSentinel {
+		if line == sentinel {
 			return true
 		}
 	}
 	return false
 }
+
+// maxPreludeBytes bounds the prelude the way the query file is bounded: a catalog of a few
+// hundred views is kilobytes, and a megabyte here is a mistake, not a catalog.
+const maxPreludeBytes = 1 << 20
 
 func readHead(path string, n int) string {
 	f, err := os.Open(path)

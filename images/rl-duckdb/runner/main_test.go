@@ -38,9 +38,21 @@ func fakeDuckDB() int {
 	mode := strings.TrimSpace(string(modeBytes))
 
 	sentinel := func() { fmt.Println(initSentinel) }
+	// The engine executes the prelude's sentinel SELECT like any other; the fake echoes
+	// it whenever the script carries it, except in the mode that fails inside the prelude.
+	preludeSentinelIfPresent := func() {
+		if strings.Contains(string(script), "SELECT '"+preludeSentinel+"';") {
+			fmt.Println(preludeSentinel)
+		}
+	}
 	switch mode {
+	case "prelude_error":
+		sentinel()
+		fmt.Fprintln(os.Stderr, "HTTP Error: Unable to connect to URL \"https://rl-sample-data-us-east-2-081295254213.s3.us-east-2.amazonaws.com/retail/sf1/iceberg/v3/bronze/sales/metadata/version-hint.text\"")
+		return 1
 	case "sql_error":
 		sentinel()
+		preludeSentinelIfPresent()
 		fmt.Fprintf(os.Stderr, "Catalog Error: Table with name %s does not exist!\nLINE 1: SELECT secret_column FROM %s\n", canary, canary)
 		return 1
 	case "init_error":
@@ -61,6 +73,7 @@ func fakeDuckDB() int {
 	}
 	// Success: honour the COPY targets the runner wrote into the script.
 	sentinel()
+	preludeSentinelIfPresent()
 	s := string(script)
 	rows := "1"
 	if b, err := os.ReadFile(filepath.Join(home, "fake_rows")); err == nil {
@@ -474,5 +487,103 @@ func TestConfigValidation(t *testing.T) {
 	}
 	if cfg.queryFile != "/run/rl/query.sql" || cfg.workDir != "/work" || cfg.resultFile != "/work/result.parquet" {
 		t.Errorf("defaults = %+v", cfg)
+	}
+}
+
+// THE PRELUDE RUNS WHOLE, AFTER THE LOCK AND THE INIT SENTINEL, BEFORE THE STATEMENT, AND
+// A FAILURE INSIDE IT HAS ITS OWN CLASS.
+func TestThePreludeRunsBeforeTheStatementAndOutsideTheClassification(t *testing.T) {
+	prelude := "CREATE SCHEMA IF NOT EXISTS bronze;\nCREATE VIEW IF NOT EXISTS bronze.sales AS SELECT * FROM iceberg_scan('https://b/retail/sf1/iceberg/v3/bronze/sales', allow_moved_paths=true);\n"
+	h := newHarness(t, "SELECT count(*) FROM bronze.sales;\n", nil)
+	preludeFile := filepath.Join(h.work, "prelude.sql")
+	if err := os.WriteFile(preludeFile, []byte(prelude), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.preludeFile = preludeFile
+	m, code, _ := h.exec()
+	if code != 0 || m.Status != "succeeded" {
+		t.Fatalf("want succeeded/0, got %+v code %d", m, code)
+	}
+	s := h.script()
+	lock, init, pre, sent, stmt := strings.Index(s, "SET lock_configuration=true;"), strings.Index(s, "SELECT 'RL_INIT_OK';"), strings.Index(s, "CREATE SCHEMA IF NOT EXISTS bronze;"), strings.Index(s, "SELECT 'RL_PRELUDE_OK';"), strings.Index(s, "CREATE TEMP TABLE __rl_result")
+	if !(lock < init && init < pre && pre < sent && sent < stmt) {
+		t.Fatalf("order must be lock < init sentinel < prelude < prelude sentinel < statement:\n%s", s)
+	}
+	// Two statements in the prelude reached the engine whole: it was not put through
+	// singleStatement(), which would have refused it.
+	if !strings.Contains(s, "CREATE VIEW IF NOT EXISTS bronze.sales AS SELECT * FROM iceberg_scan(") {
+		t.Fatalf("the prelude's second statement did not reach the engine:\n%s", s)
+	}
+}
+
+func TestNoPreludeMeansTheScriptTheRunnerAlwaysWrote(t *testing.T) {
+	h := newHarness(t, "SELECT 1;\n", nil)
+	if _, code, _ := h.exec(); code != 0 {
+		t.Fatal("baseline run failed")
+	}
+	if s := h.script(); strings.Contains(s, preludeSentinel) || strings.Contains(s, "CREATE SCHEMA") {
+		t.Fatalf("a run with no RL_PRELUDE_FILE carried a prelude:\n%s", s)
+	}
+}
+
+func TestAFailureInsideThePreludeIsItsOwnClass(t *testing.T) {
+	h := newHarness(t, "SELECT count(*) FROM bronze.sales;\n", nil)
+	preludeFile := filepath.Join(h.work, "prelude.sql")
+	if err := os.WriteFile(preludeFile, []byte("CREATE SCHEMA IF NOT EXISTS bronze;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.preludeFile = preludeFile
+	if err := os.WriteFile(filepath.Join(h.work, "fake_mode"), []byte("prelude_error"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, code, _ := h.exec()
+	if code != 1 || m.Status != "failed" || m.ErrorClass != classPrelude {
+		t.Fatalf("want failed/1/%s, got %+v code %d", classPrelude, m, code)
+	}
+	// The known negatives: it is not the statement's fault and not the image's.
+	if m.ErrorClass == classSQL || m.ErrorClass == classRunnerIO {
+		t.Fatalf("a prelude failure was classified as %s", m.ErrorClass)
+	}
+}
+
+// And a statement that fails AFTER a prelude that succeeded is still the statement's.
+func TestAStatementFailureAfterAPreludeIsStillTheStatements(t *testing.T) {
+	h := newHarness(t, "SELECT secret_column FROM rl_canary_customers;\n", nil)
+	preludeFile := filepath.Join(h.work, "prelude.sql")
+	if err := os.WriteFile(preludeFile, []byte("CREATE SCHEMA IF NOT EXISTS bronze;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.preludeFile = preludeFile
+	if err := os.WriteFile(filepath.Join(h.work, "fake_mode"), []byte("sql_error"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, _, _ := h.exec()
+	// Whatever the statement's own class is, it is not the prelude's and not the image's.
+	if m.ErrorClass == "" || m.ErrorClass == classPrelude || m.ErrorClass == classRunnerIO {
+		t.Fatalf("a statement failure after a good prelude was classified as %q", m.ErrorClass)
+	}
+}
+
+func TestAMissingOrOversizedPreludeIsRefusedBeforeTheEngineRuns(t *testing.T) {
+	h := newHarness(t, "SELECT 1;\n", nil)
+	h.cfg.preludeFile = filepath.Join(h.work, "absent.sql")
+	if m, code, _ := h.exec(); code != 1 || m.ErrorClass != classRunnerIO {
+		t.Fatalf("a missing prelude file: want runner_io/1, got %+v code %d", m, code)
+	}
+	if _, err := os.Stat(filepath.Join(h.work, "fake_script.sql")); err == nil {
+		t.Fatal("the engine ran although the prelude could not be read")
+	}
+	// A fresh harness: one run prints one metrics line, and the harness holds it to that.
+	h2 := newHarness(t, "SELECT 1;\n", nil)
+	big := filepath.Join(h2.work, "big.sql")
+	if err := os.WriteFile(big, []byte(strings.Repeat("-- x\n", (maxPreludeBytes/5)+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h2.cfg.preludeFile = big
+	if m, code, _ := h2.exec(); code != 1 || m.ErrorClass != classRunnerIO {
+		t.Fatalf("an oversized prelude: want runner_io/1, got %+v code %d", m, code)
+	}
+	if _, err := os.Stat(filepath.Join(h2.work, "fake_script.sql")); err == nil {
+		t.Fatal("the engine ran although the prelude was oversized")
 	}
 }
