@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,10 +67,22 @@ type metrics struct {
 	PeakMemoryBytes int64   `json:"peak_memory_bytes"`
 	WallSeconds     float64 `json:"wall_seconds"`
 	ResultBytes     int64   `json:"result_bytes"`
-	ErrorClass      string  `json:"error_class,omitempty"`
+	// ResultUploaded says the result reached the object store the agent named. The
+	// agent emits a ResultHandle only when it is true: a handle for an object that was
+	// never written sends a browser to the storage endpoint for an XML error that
+	// quotes the customer's bucket, which is a worse answer than no download link.
+	// Absent on an older runner, which decodes as false — correctly, since an older
+	// runner uploads nothing.
+	ResultUploaded bool   `json:"result_uploaded"`
+	ErrorClass     string `json:"error_class,omitempty"`
 }
 
 type config struct {
+	// uploadURL is the presigned PUT the result is sent to, empty when the agent minted
+	// none. uploadHeaders are the headers its signature covers and must be sent verbatim.
+	uploadURL     string
+	uploadHeaders map[string]string
+
 	queryFile   string
 	workDir     string
 	resultFile  string
@@ -101,6 +115,24 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		initFile:  or(getenv("RL_INIT_FILE"), "/opt/duckdb/init.sql"),
 	}
 	c.resultFile = or(getenv("RL_RESULT_FILE"), filepath.Join(c.workDir, "result.parquet"))
+	// THE UPLOAD, WHEN THE AGENT MINTED ONE. A presigned PUT and the headers its
+	// signature covers. No credential reaches this pod — automountServiceAccountToken is
+	// false and the admission policy refuses it otherwise — so a signed URL is the only
+	// way the result leaves, and it is deliberately all this process can do with it: one
+	// method, one key, one deadline.
+	//
+	// BOTH OR NEITHER. The headers are part of what was signed, so sending the URL
+	// without them fails the signature rather than writing an unencrypted object. A URL
+	// with no headers is treated as no upload at all rather than attempted and lost.
+	c.uploadURL = strings.TrimSpace(getenv("RL_RESULT_UPLOAD_URL"))
+	if h := strings.TrimSpace(getenv("RL_RESULT_UPLOAD_HEADERS")); h != "" && c.uploadURL != "" {
+		if err := json.Unmarshal([]byte(h), &c.uploadHeaders); err != nil {
+			return c, fmt.Errorf("RL_RESULT_UPLOAD_HEADERS is not a JSON object: %w", err)
+		}
+	}
+	if len(c.uploadHeaders) == 0 {
+		c.uploadURL = ""
+	}
 	if v := getenv("RL_THREADS"); v != "" {
 		if !threadsRE.MatchString(v) {
 			return c, fmt.Errorf("RL_THREADS must be a positive integer, got %q", v)
@@ -271,6 +303,23 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	}
 	m.RowsOut = rows
 	m.ResultBytes = fi.Size()
+
+	// THE UPLOAD IS THE LAST THING, AND IT DOES NOT DECIDE THE QUERY.
+	//
+	// The query ran and its numbers are real whether or not the result reaches the
+	// bucket, so a failed upload is reported as a successful query with
+	// result_uploaded false — the caller sees their metrics and no download link, and
+	// can re-run. Failing the run instead would tell somebody their query failed when
+	// it did not, and would lose the metrics the cost path needs.
+	if cfg.uploadURL != "" {
+		if err := upload(ctx, cfg, fi.Size()); err != nil {
+			// The URL is NEVER in the note: it carries its own authorisation in its
+			// query string, and error.log is readable to anyone who reads the pod.
+			note("result upload failed: %v", redactURL(err))
+		} else {
+			m.ResultUploaded = true
+		}
+	}
 	return finish("", 0)
 }
 
@@ -576,4 +625,75 @@ func maxRSSBytes(maxrss int64) int64 {
 
 func round6(f float64) float64 {
 	return math.Round(f*1e6) / 1e6
+}
+
+// uploadTimeout bounds the PUT. Generous, because a large result over a NAT gateway is
+// not fast, and bounded because a hung upload would otherwise outlive the query and be
+// killed by the pod's deadline with no report at all — the one outcome worse than a
+// failed upload, since it loses the metrics too.
+const uploadTimeout = 10 * time.Minute
+
+// upload sends the result file to the presigned PUT the agent minted.
+//
+// It streams the file rather than reading it into memory: a result is bounded by the
+// sandbox's disk, not by its RAM, and the memory limit here is the engine's.
+// Content-Length is set from the size already stat'd, because S3 refuses a chunked PUT
+// against a presigned URL.
+//
+// EVERY HEADER IS SENT VERBATIM. They are part of what was signed — the SSE-KMS pair —
+// so dropping one or altering it fails the signature rather than writing an unencrypted
+// object. That is the property which lets a pod holding no credential write to an
+// encrypted bucket without being able to choose how it is encrypted.
+func upload(ctx context.Context, cfg config, size int64) error {
+	f, err := os.Open(cfg.resultFile)
+	if err != nil {
+		return fmt.Errorf("opening the result: %w", err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, cfg.uploadURL, f)
+	if err != nil {
+		return fmt.Errorf("building the request: %w", err)
+	}
+	req.ContentLength = size
+	for k, v := range cfg.uploadHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// The body of an S3 error is XML naming the bucket and key. It is drained so the
+	// connection can be reused and then dropped unread: the status is the whole signal,
+	// and 403 on a presigned PUT means the signature or the headers, which is ours.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("the object store refused the upload with status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// redactURL removes the presigned URL from an error before it reaches error.log.
+//
+// This is not defensive tidiness. net/http wraps transport failures in *url.Error, which
+// embeds the FULL request URL — query string included — and a presigned URL's query
+// string IS its authorisation. An unredacted DNS or TLS failure would therefore write a
+// working credential for the customer's own object into a log file that anybody who can
+// read the pod can read, for as long as the URL lives.
+func redactURL(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		// Keep the operation and the cause, drop the URL entirely rather than trying to
+		// strip its query: a truncated URL still names the bucket and the key.
+		return fmt.Errorf("%s: %v", ue.Op, ue.Err)
+	}
+	return err
 }

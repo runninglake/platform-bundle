@@ -1,3 +1,6 @@
 # Go build output and local scratch
 images/rl-duckdb/runner/rl-duckdb-runner
 *.parquet
+# `go build ./...` in images/rl-duckdb/runner drops a binary named after the package
+# directory. It is 9.8 MB and it is not a source file.
+images/rl-duckdb/runner/runner
