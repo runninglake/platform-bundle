@@ -66,9 +66,31 @@ and this environment:
 | `RL_THREADS` | DuckDB `threads` |
 | `RL_MEMORY_LIMIT` | DuckDB `memory_limit`, e.g. `512MB` |
 | `RL_TIMEOUT_SECONDS` | wall-clock limit; the engine is killed at it. Unset or `0`: no runner-side limit, the pod's `activeDeadlineSeconds` is the only one |
+| `RL_RESULT_UPLOAD_URL` | a presigned `PUT` the result is sent to. Absent: the result stays in the emptyDir and dies with the pod |
+| `RL_RESULT_UPLOAD_HEADERS` | a JSON object of headers the presigned signature covers, sent verbatim. Required with the URL; a URL without it is treated as no upload |
 | `HOME` | `/work` |
 
 No variable may start with `AWS_`. Egress is DNS and TCP 443 only.
+
+**The upload carries no credential, and that is the point.** This pod runs with
+`automountServiceAccountToken: false` and the admission policy refuses it otherwise, so it
+can authenticate to nothing. A presigned URL is not an identity: it is a signed statement
+that one method may be used on one key until one deadline, and the headers are part of
+what was signed — so dropping one does not write an unencrypted object, it fails the
+signature. That is what lets a result leave a pod which is deliberately unable to
+authenticate.
+
+**A failed upload is a successful query without a link.** The query ran and its numbers
+are real, so the report says `result_uploaded: false` and the run still exits 0. Reporting
+a failure would tell a user their query failed when it did not, and would lose the metrics
+the cost path settles from. The agent emits a result handle only when `result_uploaded` is
+true, because a handle for an object that was never written sends a browser to the storage
+endpoint for an XML error quoting the customer's bucket.
+
+**The URL never reaches `error.log`.** Its query string is its authorisation, and
+`net/http` wraps transport failures in a `*url.Error` that embeds the whole URL — so an
+unredacted DNS or TLS failure would write a working credential for the customer's own
+object into a file anybody who can read the pod can read.
 
 The runner:
 
@@ -95,10 +117,23 @@ The runner:
    - anything else: executed as-is; `rows_out` is 0 and no result file is written.
 3. Prints **exactly one line** to stdout and nothing to stderr:
    ```
-   RL_METRICS {"status":"succeeded","rows_out":1,"bytes_scanned":0,"cpu_core_seconds":0.41,"peak_memory_bytes":97218560,"wall_seconds":0.52,"result_bytes":631}
+   RL_METRICS {"status":"succeeded","rows_out":1,"bytes_scanned":0,"cpu_core_seconds":0.41,"peak_memory_bytes":97218560,"wall_seconds":0.52,"result_bytes":631,"result_uploaded":true}
    ```
-   `error_class` is present only on failure and is one of `sql_error` (any DuckDB error
-   raised by the statement), `query_timeout`, `out_of_memory` (DuckDB's
+   `error_class` is present only on failure. When DuckDB names the kind of error, the
+   runner says which: `catalog_error` (a table or schema the engine could not find),
+   `binder_error` (a column or function it could not resolve), `syntax_error`,
+   `io_error`, `http_error` and `permission_denied`. `sql_error` remains the answer for
+   any DuckDB error whose kind is not one of those — guessing a kind is worse than
+   declining to, because a wrong class sends a person to look in the wrong place.
+
+   That list is not new to the platform: `internal/agent/duckdb`'s `RunnerClasses` has
+   admitted all of them from the start and `cmd/rl` carries a sentence for each. What was
+   new is a runner that says one. Before this every engine error was `sql_error`, so a
+   person querying a table their project had DECLARED was told "the engine reported an
+   error in the statement" — pointing at their SQL, which was fine; the sandbox simply has
+   no catalog to find the table in.
+
+   The rest: `query_timeout`, `out_of_memory` (DuckDB's
    "Out of Memory Error", or the engine killed by SIGKILL outside the runner's own
    timeout), `runner_io_error` (the runner could not do its own work: work directory,
    result or count file, the engine binary, or the engine failed before the statement

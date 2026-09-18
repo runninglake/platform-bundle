@@ -216,8 +216,19 @@ func TestSQLErrorNeverReachesStdout(t *testing.T) {
 	h := newHarness(t, "SELECT secret_column FROM "+canary, nil)
 	h.mode("sql_error")
 	m, code, line := h.exec()
-	if code != 1 || m.Status != "failed" || m.ErrorClass != classSQL {
-		t.Fatalf("want failed/sql_error/1, got %+v code %d", m, code)
+	// classCatalog, not classSQL: the fake's message leads with "Catalog Error", and the
+	// runner now names the kind DuckDB named instead of reporting every engine error as
+	// sql_error. This assertion is ALSO the only coverage that run() actually calls the
+	// classifier — the unit tests exercise classifyEngineError directly, so deleting the
+	// call site leaves them green and this red.
+	if code != 1 || m.Status != "failed" || m.ErrorClass != classCatalog {
+		t.Fatalf("want failed/catalog_error/1, got %+v code %d", m, code)
+	}
+	// THE CLASS IS A TOKEN FROM OUR LIST, NEVER A SLICE OF THE ENGINE'S SENTENCE. The
+	// check below would pass a class of "Catalog Error" only by accident of case, so it
+	// is worth being explicit: what crosses is a word we chose.
+	if strings.Contains(m.ErrorClass, " ") || strings.ToLower(m.ErrorClass) != m.ErrorClass {
+		t.Errorf("error_class %q looks like engine prose rather than a token", m.ErrorClass)
 	}
 	for _, leak := range []string{canary, "secret_column", "Catalog Error", "SELECT"} {
 		if strings.Contains(line, leak) {
