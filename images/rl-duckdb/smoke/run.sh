@@ -56,7 +56,13 @@ COUNT_JSON="$LAST_JSON"
 run_case statement statement.sql succeeded - 0 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120
 [[ "$(jq -r .rows_out <<<"$LAST_JSON")" == 0 ]] || { echo "  rows_out != 0 for a non-query"; FAILED=1; }
 
-run_case syntax_error syntax_error.sql failed sql_error 1 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120
+# The classes the runner reports for an engine refusal, one case each. The runner used
+# to fold every engine error into sql_error; since #2 it reads the engine's own prefix,
+# and the smoke has to say which one it means — a case named syntax_error that queried a
+# missing TABLE was a catalog error by the engine's own words, and the first build after
+# #2 failed exactly there. Merges here build nothing; only a tag runs this.
+run_case catalog_error catalog_error.sql failed catalog_error 1 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120
+run_case syntax_error syntax_error.sql failed syntax_error 1 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120
 
 run_case timeout timeout.sql failed query_timeout 2 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=2
 
