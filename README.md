@@ -109,7 +109,9 @@ The runner:
    change any setting, then the statement:
    - first token `SELECT`, `WITH`, `FROM`, `VALUES`, `PIVOT`, `UNPIVOT` (case-insensitive),
      or a leading `(`: `CREATE TEMP TABLE __rl_result AS <statement>`, then
-     `COPY __rl_result TO '<RL_RESULT_FILE>' (FORMAT PARQUET)`, then `count(*)` of the
+     a COPY the script GENERATES from the result's own schema — `HUGEINT` and `UHUGEINT`
+     columns cast to `DECIMAL(38,0)`, because Parquet has no 128-bit integer and the
+     writer's own mapping is `DOUBLE`, which silently rounds a sum past 2^53 — then `count(*)` of the
      table written to `<RL_WORK_DIR>/rowcount.csv`. No row is ever printed.
    - `DESCRIBE`, `SHOW`, `SUMMARIZE`: the same, materialised through
      `CREATE TEMP TABLE __rl_result AS SELECT * FROM (<statement>)`, because DuckDB does

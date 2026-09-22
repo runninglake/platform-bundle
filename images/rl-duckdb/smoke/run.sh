@@ -77,6 +77,13 @@ run_case count_to_disk count.sql succeeded - 0 --network none -v "$WORK:/work" -
 [[ -s "$WORK/rowcount.csv" && -f "$WORK/error.log" && -d "$WORK/tmp" ]] || { echo "  expected work files missing: $(ls "$WORK")"; FAILED=1; }
 run_case verify_result verify_result.sql succeeded - 0 --network none -v "$WORK:/work" -e RL_RESULT_FILE=/work/verify.parquet -e RL_TIMEOUT_SECONDS=120
 
+# A wide integer keeps its digits. hugeint.sql writes /work/result.parquet with a sum
+# past 2^53; verify_hugeint.sql reads it back and error()s unless it is exact, which is
+# an sql_error and so a failed case. The pair has to run in this order against the same
+# /work, like count/verify_result above.
+run_case hugeint hugeint.sql succeeded - 0 --network none -v "$WORK:/work" -e RL_TIMEOUT_SECONDS=120
+run_case verify_hugeint verify_hugeint.sql succeeded - 0 --network none -v "$WORK:/work" -e RL_RESULT_FILE=/work/verify_hugeint.parquet -e RL_TIMEOUT_SECONDS=120
+
 if [[ $FAILED == 0 ]]; then
   echo "smoke: all cases passed"
   echo "SMOKE_METRICS=$COUNT_JSON"
