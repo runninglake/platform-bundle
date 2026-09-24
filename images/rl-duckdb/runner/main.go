@@ -44,6 +44,8 @@ const (
 	// resultTable is the temp table the statement is materialised into before it is
 	// copied to Parquet. Reserved: a statement that names it collides with itself.
 	resultTable = "__rl_result"
+	// copyScript is where the generated COPY statement is written, inside tmpDir.
+	copyScript = "rl_copy_result.sql"
 
 	// initSentinel is printed by the script after every configuration and LOAD and
 	// before the statement. Its absence on failure means the engine, not the SQL, broke.
@@ -460,10 +462,74 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, stmt 
 		fmt.Fprintf(&b, "%s\n;\n", stmt)
 	}
 	if kind != kindStatement {
-		fmt.Fprintf(&b, "COPY %s TO %s (FORMAT PARQUET);\n", resultTable, sqlString(cfg.resultFile))
+		b.WriteString(copyResultSQL(cfg.resultFile, filepath.Join(tmpDir, copyScript)))
 		fmt.Fprintf(&b, "COPY (SELECT count(*) FROM %s) TO %s (FORMAT CSV, HEADER false);\n", resultTable, sqlString(countFile))
 	}
 	return b.String()
+}
+
+// A HUGEINT RESULT COLUMN LOSES ITS DIGITS IN PARQUET, AND `COPY <table> TO` CANNOT SAY SO.
+//
+// DuckDB widens SUM over any integer column to HUGEINT — `SUM(quantity)` on a BIGINT is
+// enough, so this is the common case and not an exotic one. Parquet has no 128-bit
+// integer, and DuckDB's writer maps HUGEINT to DOUBLE. Measured on 1.5.5, the pinned CLI:
+//
+//	SELECT SUM(x) FROM (SELECT 9007199254740993::BIGINT AS x)
+//	  written as DOUBLE, read back as 9007199254740992
+//
+// The digit is gone before any reader sees the file, so nothing downstream can detect it:
+// the customer downloads a wrong number that looks right. DECIMAL(38,0) is the mapping
+// that keeps it — Parquet carries a 38-digit decimal as FIXED_LEN_BYTE_ARRAY with an
+// unscaled integer, which is exact, and the control plane's decoder already refuses to
+// pass a decimal through a float.
+//
+// WHY THE SCRIPT GENERATES ITS OWN COPY. The cast has to name the columns, and nothing
+// knows them until the statement has run: `COPY <table> TO` takes no type mapping, no
+// setting controls it, and `COLUMNS(*)` cannot select on type. So the script asks
+// duckdb_columns() for the result's own schema and writes ONE COPY statement to a file,
+// which `.read` then executes. The alternative is a second engine invocation, which would
+// split the CPU and memory accounting this runner reports from one ProcessState.
+//
+// WHY THIS IS NOT AN INJECTION SEAM, since a dot-command in a DuckDB script is exactly
+// one: every identifier is emitted inside double quotes with `"` doubled, and a double
+// quote is the only thing that can end a quoted identifier — a newline or a semicolon in
+// a column name stays inside it. The path is the runner's own, under the work directory.
+// The customer's statement cannot reach `.read`: it is embedded inside CREATE TEMP TABLE
+// … AS, so the CLI's statement buffer is never empty at the start of one of its lines,
+// and loadQuery refuses a statement beginning with '.' or '#' outright.
+func copyResultSQL(resultFile, scriptFile string) string {
+	var b strings.Builder
+	// The generated statement, built from the result's own catalog entry — and ONLY that
+	// one. `database_name = 'temp'` is not decoration: duckdb_columns() lists every table
+	// of that name in every attached database and schema, and measured on 1.5.5 a table
+	// `other.__rl_result` beside the temp one put its columns into this statement, which
+	// then named a column the result does not have and failed the customer's query. The
+	// prelude attaches the customer's catalog, so their namespace is exactly where a
+	// same-named table would be. QUOTE '' and a
+	// delimiter that cannot occur in SQL keep the CSV writer from quoting or splitting it.
+	fmt.Fprintf(&b, `COPY (
+  SELECT 'COPY (SELECT ' || string_agg(
+      CASE WHEN data_type IN ('HUGEINT', 'UHUGEINT')
+           THEN '"' || replace(column_name, '"', '""') || '"::DECIMAL(38,0) AS "' || replace(column_name, '"', '""') || '"'
+           ELSE '"' || replace(column_name, '"', '""') || '"' END, ', ' ORDER BY column_index)
+    || ' FROM %s) TO %s (FORMAT PARQUET);'
+  FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '%s'
+) TO %s (FORMAT CSV, HEADER false, QUOTE '', DELIMITER E'\x01');
+`, resultTable, nestedSQLString(resultFile), resultTable, sqlString(scriptFile))
+	fmt.Fprintf(&b, ".read %s\n", scriptFile)
+	return b.String()
+}
+
+// nestedSQLString quotes a string that will sit inside a SQL literal which is itself
+// inside a SQL literal — the generated COPY is a value in the statement that writes it,
+// so every quote has to survive two levels.
+//
+// Getting this wrong produces no error a unit test would see: with a single level DuckDB
+// read `TO '/work/result.parquet'` as a string, a stray identifier and then a type, and
+// answered "Type with name parquet does not exist". The real engine found that on the
+// first run; the fake engine every other test in this package drives cannot.
+func nestedSQLString(s string) string {
+	return "''" + strings.ReplaceAll(s, "'", "''''") + "''"
 }
 
 func sqlString(s string) string {
