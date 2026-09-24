@@ -207,6 +207,6 @@ jobs:
             echo '```'
             echo "linux/amd64 only. Uncompressed ${{ steps.size.outputs.uncompressed }} bytes, compressed ${{ steps.compressed.outputs.compressed }} bytes, budget ${SIZE_BUDGET_BYTES}."
             echo
-            echo "A NEW PACKAGE IS BORN PRIVATE on ghcr: its visibility must be set to public in the GitHub UI before any plane can pull it."
+            echo "Visibility: this repository is public, and a package it publishes is born public — measured on rl-trino's first release, which answered an anonymous pull. (The private repository's images are the ones born private.)"
             echo "Record the digest against a train serial in \`runtimes/index.yaml\` (private repository, ADR 9) — that is the train procedure's step, not this job's."
           } >> "$GITHUB_STEP_SUMMARY"
