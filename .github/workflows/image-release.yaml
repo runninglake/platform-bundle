@@ -91,6 +91,11 @@ jobs:
       # bumped digest with an unedited table would ship an image whose published
       # provenance describes different bytes. Documentation nobody checks is documentation
       # that is eventually false.
+      # THE NAME PATTERN INCLUDES DIGITS, and until 2026-09-24 it did not: `[A-Z_]+` stops at
+      # the "256" in DUCKDB_CLI_SHA256, so every engine pin — the CLI and all three extension
+      # hashes — was silently skipped and this gate checked only the three base-image
+      # digests. Found while writing rl-trino's copy of this step, whose two engine pins it
+      # also missed. The step now prints how many pins it checked.
       - name: PINS.md names every pin the Dockerfile enforces
         run: |
           set -euo pipefail
@@ -100,13 +105,15 @@ jobs:
               echo "::error::$value is enforced by the Dockerfile and absent from PINS.md"
               missing=1
             }
-          done < <(grep -oE '^[[:space:]]*ARG [A-Z_]+=(sha256:)?[0-9a-f]{64}' images/rl-duckdb/Dockerfile \
-                   | sed -E 's/^[[:space:]]*ARG [A-Z_]+=//')
+          done < <(grep -oE '^[[:space:]]*ARG [A-Z0-9_]+=(sha256:)?[0-9a-f]{64}' images/rl-duckdb/Dockerfile \
+                   | sed -E 's/^[[:space:]]*ARG [A-Z0-9_]+=//')
           version=$(grep -oE '^[[:space:]]*ARG DUCKDB_VERSION=[0-9.]+' images/rl-duckdb/Dockerfile | head -1 | cut -d= -f2)
           grep -qF "$version" images/rl-duckdb/PINS.md || {
             echo "::error::PINS.md does not name DuckDB $version"
             missing=1
           }
+          n=$(grep -cE '^[[:space:]]*ARG [A-Z0-9_]+=(sha256:)?[0-9a-f]{64}' images/rl-duckdb/Dockerfile)
+          echo "checked ${n} enforced pins"
           test "$missing" = 0
           echo "every enforced pin appears in PINS.md, DuckDB ${version}"
 

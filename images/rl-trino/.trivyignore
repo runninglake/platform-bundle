@@ -1,0 +1,39 @@
+# Every line carries an expiry (`CVE exp:YYYY-MM-DD`). On that date Trivy fails the release
+# again, so the next Trino or base bump has to re-evaluate the finding rather than inherit
+# the silence. Each line names the component, why nothing in a RunningLake deployment
+# reaches it, and the fixed version. Measured 2026-09-24 with trivy 0.66.0 against the
+# image built from this directory; Trino 483 is the newest release (published 2026-07-18),
+# so none of these is fixable by upgrading.
+
+# --- netty, inside the kept iceberg plugin (usr/lib/trino/plugin/iceberg) --------------
+# SslClientHelloHandler is the SERVER side of TLS SNI routing: it selects an SslContext for
+# an incoming ClientHello. Nothing in Trino runs a Netty TLS server — the HTTP server is
+# Jetty — and the plugin uses Netty only as a client transport. Fixed in 4.2.17.Final.
+CVE-2026-75595 exp:2026-12-31
+# SCTP. Nothing in Trino opens an SCTP socket. Fixed in 4.2.17.Final.
+CVE-2026-59902 exp:2026-12-31
+
+# --- libthrift 0.23.0, inside the kept iceberg plugin -----------------------------------
+# Reached only through an Iceberg catalog of type hive_metastore (a Thrift client to a
+# metastore), and the loop needs a hostile SERVER response. RunningLake's Iceberg catalogs
+# are REST (Lakekeeper); the image bakes no Thrift catalog, and the Hive and Hudi
+# connectors are not shipped. Fixed in 0.24.0.
+CVE-2026-43871 exp:2026-12-31
+
+# --- the launcher, usr/lib/trino/bin/linux-amd64/launcher (Go 1.26.4, x/text 0.33.0) ---
+# The launcher reads jvm.config, node.properties and launcher.properties — files baked
+# into the image or mounted by the deployment, never input from a user or the network —
+# and execs java. It serves no HTTP or HTTP/2, performs no TLS, and parses no DNS, XML,
+# ASN.1, URLs, templates or untrusted text. Fixed in Go 1.26.6 / x/text 0.39.0; upstream
+# rebuilds the launcher with each release, so the next Trino release is expected to clear
+# these, and the expiry makes sure somebody looks.
+CVE-2026-56852 exp:2026-12-31
+CVE-2026-33818 exp:2026-12-31
+CVE-2026-39821 exp:2026-12-31
+CVE-2026-39822 exp:2026-12-31
+CVE-2026-46600 exp:2026-12-31
+CVE-2026-56853 exp:2026-12-31
+CVE-2026-56858 exp:2026-12-31
+CVE-2026-56859 exp:2026-12-31
+CVE-2026-56860 exp:2026-12-31
+CVE-2026-56862 exp:2026-12-31
