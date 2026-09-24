@@ -1,0 +1,18 @@
+rl-trino
+========
+
+This image is based on Trino 483 with 0 RunningLake patches.
+
+Upstream components, unmodified:
+
+  Trino server 483              Apache-2.0                       Trino Software Foundation
+  Eclipse Temurin JRE 25.0.1+8  GPL-2.0 with Classpath Exception Eclipse Adoptium
+  Red Hat UBI 9 minimal         Red Hat UBI EULA                 Red Hat
+
+Trino is a project of the Trino Software Foundation, not of the Apache Software
+Foundation. Of the 55 plugins the Trino 483 server distribution ships, this image keeps
+five — iceberg, jmx, memory, opa, tpcds — and removes the rest; nothing inside a kept
+plugin is modified. Each upstream component's own NOTICE and LICENSE files are shipped
+where upstream placed them.
+
+RunningLake content: the default configuration under /etc/trino and this file.

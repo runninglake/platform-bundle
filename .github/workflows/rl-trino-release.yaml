@@ -1,0 +1,212 @@
+# Build, smoke, scan, sign and publish rl-trino.
+#
+# A sibling of image-release.yaml (rl-duckdb), with the same order and the same reasons:
+# every gate that can reject the image runs against a LOCAL build, and the push happens only
+# after all of them pass, so a rejected build leaves nothing in the registry. The digest in
+# the step summary is what runtimes/index.yaml records against a train serial (ADR 9); the
+# tag is a convenience nobody consumes.
+#
+# linux/amd64 ONLY, as rl-duckdb: the conformance corpus is measured on amd64, and an arm64
+# image nobody measured would make the capability table false on it.
+#
+# EVERY ACTION IS PINNED BY COMMIT, to the same commits image-release.yaml uses. This job
+# holds packages:write and id-token:write; a mutable `uses:` would let somebody else's
+# compromised release process sign an image as us.
+name: rl-trino-release
+
+on:
+  push:
+    tags: ['rl-trino/v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp and tag the image with (default dev-<sha>)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/runninglake/rl-trino
+  # Set from measurement, not from hope: the flattened root filesystem was 807,864,320
+  # bytes (770 MB) on 2026-09-24 — Iceberg's plugin 366 MB (it carries the cloud SDKs), the
+  # JRE 191 MB, Trino's lib 97 MB, UBI9-minimal the rest. 900 MB leaves room for a patch
+  # release and catches a plugin arriving that the allow list somehow missed.
+  SIZE_BUDGET_BYTES: "943718400"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+
+      # PINS.md IS A PROMISE: every hash and digest the Dockerfile enforces must appear in it,
+      # and the Trino version it builds must be the one it names.
+      - name: PINS.md names every pin the Dockerfile enforces
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r value; do
+            grep -qF "$value" images/rl-trino/PINS.md || {
+              echo "::error::$value is enforced by the Dockerfile and absent from PINS.md"
+              missing=1
+            }
+          done < <(grep -oE '^[[:space:]]*ARG [A-Z0-9_]+=(sha256:)?[0-9a-f]{64}' images/rl-trino/Dockerfile \
+                   | sed -E 's/^[[:space:]]*ARG [A-Z0-9_]+=//')
+          version=$(grep -oE '^[[:space:]]*ARG TRINO_VERSION=[0-9]+' images/rl-trino/Dockerfile | head -1 | cut -d= -f2)
+          grep -qF "Trino version:** ${version}" images/rl-trino/PINS.md || {
+            echo "::error::PINS.md does not name Trino ${version}"
+            missing=1
+          }
+          n=$(grep -cE '^[[:space:]]*ARG [A-Z0-9_]+=(sha256:)?[0-9a-f]{64}' images/rl-trino/Dockerfile)
+          echo "checked ${n} enforced pins"
+          test "$missing" = 0
+          echo "every enforced pin appears in PINS.md, Trino ${version}"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp
+        id: stamp
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#rl-trino/}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}"
+
+      # Local build for the gates. The cache is scoped to this image so it never evicts
+      # rl-duckdb's, and the push below reuses it rather than building twice.
+      - name: Build for the gates
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: images/rl-trino
+          file: images/rl-trino/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: rl-trino-local:${{ steps.stamp.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.stamp.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=rl-trino
+          cache-to: type=gha,mode=max,scope=rl-trino
+
+      - name: Assert the size budget
+        id: size
+        run: |
+          set -euo pipefail
+          CONTAINER="$(docker create "rl-trino-local:${{ steps.stamp.outputs.version }}")"
+          UNCOMPRESSED="$(docker export "$CONTAINER" | wc -c | tr -d ' ')"
+          docker rm "$CONTAINER" >/dev/null
+          echo "uncompressed=${UNCOMPRESSED}" >> "$GITHUB_OUTPUT"
+          printf 'uncompressed %d bytes (%d MB), budget %d bytes\n' \
+            "$UNCOMPRESSED" "$((UNCOMPRESSED / 1048576))" "$SIZE_BUDGET_BYTES"
+          if [ "$UNCOMPRESSED" -ge "$SIZE_BUDGET_BYTES" ]; then
+            echo "::error::rl-trino is ${UNCOMPRESSED} bytes uncompressed; the budget is ${SIZE_BUDGET_BYTES}."
+            exit 1
+          fi
+
+      # The server run the way a plane runs it (uid 65532, read-only root, capabilities
+      # dropped, /work the only writable path, a memory cap), against the five plugins,
+      # an Iceberg Parquet round trip, and the NEGATIVE that makes the plugin stripping
+      # mean something: a catalog naming a connector this image does not ship must stop
+      # the server. Details in images/rl-trino/smoke/run.sh.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          images/rl-trino/smoke/run.sh "rl-trino-local:${{ steps.stamp.outputs.version }}" | tee /tmp/smoke.log
+          # A gate that cannot tell "passed" from "did nothing" is not a gate: the run must
+          # report success AND have printed one `ok` per `# CASE` marker in the script,
+          # derived from the script so adding a case cannot leave this behind.
+          EXPECTED="$(grep -cE '^# CASE [0-9]+\. ' images/rl-trino/smoke/run.sh)"
+          ACTUAL="$(grep -c '^ok ' /tmp/smoke.log || true)"
+          grep -qx 'smoke: all cases passed' /tmp/smoke.log \
+            || { echo "::error::the smoke run never reported that all cases passed"; exit 1; }
+          if [ "$EXPECTED" -lt 1 ] || [ "$ACTUAL" -ne "$EXPECTED" ]; then
+            echo "::error::smoke passed ${ACTUAL} cases; run.sh declares ${EXPECTED}."
+            exit 1
+          fi
+          echo "smoke passed ${ACTUAL}/${EXPECTED} cases"
+
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: rl-trino-local:${{ steps.stamp.outputs.version }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          # Dated, justified exceptions, each with its reason and fixed version; see the
+          # file. On the expiry date this step fails again and somebody has to look.
+          trivyignores: images/rl-trino/.trivyignore
+
+      # Every gate has passed. Only now do these bytes become visible to anyone.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: images/rl-trino
+          file: images/rl-trino/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.stamp.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.stamp.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=rl-trino
+          cache-to: type=gha,mode=max,scope=rl-trino
+
+      - name: Refuse a digest the build did not produce
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::the build reported no usable digest: '$DIGEST'"; exit 1; }
+          echo "build reported $DIGEST"
+
+      - name: Record the compressed size
+        id: compressed
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}@${{ steps.build.outputs.digest }}"
+          MANIFEST="$(docker buildx imagetools inspect "$REF" --raw \
+            | jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')"
+          COMPRESSED="$(docker buildx imagetools inspect "${IMAGE}@${MANIFEST}" --raw | jq '[.layers[].size] | add')"
+          echo "compressed=${COMPRESSED}" >> "$GITHUB_OUTPUT"
+          printf 'compressed %d bytes (%d MB)\n' "$COMPRESSED" "$((COMPRESSED / 1048576))"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign
+        run: |
+          cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Report the digest
+        run: |
+          {
+            echo "### rl-trino ${{ steps.stamp.outputs.version }}"
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "linux/amd64 only. Uncompressed ${{ steps.size.outputs.uncompressed }} bytes, compressed ${{ steps.compressed.outputs.compressed }} bytes, budget ${SIZE_BUDGET_BYTES}."
+            echo
+            echo "A NEW PACKAGE IS BORN PRIVATE on ghcr: its visibility must be set to public in the GitHub UI before any plane can pull it."
+            echo "Record the digest against a train serial in \`runtimes/index.yaml\` (private repository, ADR 9) — that is the train procedure's step, not this job's."
+          } >> "$GITHUB_STEP_SUMMARY"

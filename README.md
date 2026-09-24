@@ -182,3 +182,26 @@ DuckDB Foundation and are shipped unmodified; each image carries a
 `/NOTICE.runninglake` naming every upstream component, its version and its licence.
 DuckDB is a trademark of the DuckDB Foundation; `rl-duckdb` is "based on DuckDB", not a
 DuckDB distribution.
+
+## rl-trino
+
+A Trino 483 **server** image — unlike rl-duckdb, which runs one statement per pod and
+exits, this runs as a long-lived coordinator (and later workers) that clients reach over
+Trino's HTTP protocol on port 8080. Pins, the plugin set and the scan exceptions are in
+`images/rl-trino/PINS.md`; the smoke is `images/rl-trino/smoke/run.sh`.
+
+**What a deployment must provide:**
+
+- **`/work` writable AND executable.** It is the node's data directory and the JVM's
+  `java.io.tmpdir`, and native libraries (zstd, brotli) are extracted there and mapped. A
+  `noexec` `/work` breaks them — the smoke measures this, and Kubernetes' default
+  `emptyDir` is fine. The root filesystem can and should be read-only.
+- **uid 65532.** The image sets it; the smoke runs as it with all capabilities dropped.
+- **Configuration under `/etc/trino`.** The image bakes a single-node default and three
+  catalogs (tpcds, memory, jmx). A deployment mounts its own `config.properties`,
+  `jvm.config` and `catalog/` — the Iceberg catalog is REST (Lakekeeper) and is never
+  baked, because it carries an endpoint and credentials.
+
+**Five plugins, as enforcement.** A catalog naming a connector this image does not ship
+stops the server's start (`No factory for connector 'hudi'`); the smoke asserts it, and
+asserts it fails when the Hudi plugin is put back.
