@@ -57,6 +57,27 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: images/rl-duckdb/runner/go.mod
+      # THE REAL ENGINE, FROM THE DOCKERFILE'S OWN PIN. hugeint_test.go drives the actual
+      # DuckDB CLI because every other test here drives a fake that cannot have the bugs
+      # it exists to catch, and it is FATAL in CI rather than skipped. This step did not
+      # exist when those tests landed, so rl-duckdb/v1.5.5-4 stopped at "Test the runner"
+      # and published nothing. The version and sha256 are read out of the Dockerfile's ARG
+      # defaults rather than restated here: a second copy of a pin is a pin that drifts,
+      # and the image and its tests must be proving the same binary.
+      - name: Install the pinned DuckDB CLI for the runner's real-engine tests
+        run: |
+          set -euo pipefail
+          df=images/rl-duckdb/Dockerfile
+          ver=$(sed -nE 's/^ARG DUCKDB_VERSION=([0-9.]+)$/\1/p' "$df" | head -1)
+          sum=$(sed -nE 's/^ARG DUCKDB_CLI_SHA256=([0-9a-f]{64})$/\1/p' "$df" | head -1)
+          test -n "$ver" && test -n "$sum" || { echo "::error::could not read the DuckDB pin from $df"; exit 1; }
+          curl -fsSL --retry 3 -o /tmp/duckdb_cli.zip \
+            "https://github.com/duckdb/duckdb/releases/download/v${ver}/duckdb_cli-linux-amd64.zip"
+          echo "${sum}  /tmp/duckdb_cli.zip" | sha256sum -c -
+          unzip -q -o /tmp/duckdb_cli.zip duckdb -d /tmp/duckdb-bin
+          sudo install -m 0755 /tmp/duckdb-bin/duckdb /usr/local/bin/duckdb
+          duckdb --version | grep -qE "^v${ver}( |$)" || { echo "::error::installed DuckDB is not v${ver}"; exit 1; }
+          echo "DuckDB v${ver} installed from the Dockerfile's pin"
       - name: Test the runner
         working-directory: images/rl-duckdb/runner
         run: |
