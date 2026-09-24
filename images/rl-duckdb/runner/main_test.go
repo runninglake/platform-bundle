@@ -217,7 +217,7 @@ func TestSuccessfulQuery(t *testing.T) {
 		// what the script carries is the statement that WRITES it — with the path nested
 		// one level deeper, and the `.read` that runs it.
 		"|| ' FROM __rl_result) TO ''" + h.cfg.resultFile + "'' (FORMAT PARQUET);'",
-		"FROM duckdb_columns() WHERE table_name = '__rl_result'",
+		"FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '__rl_result'",
 		".read " + filepath.Join(h.work, "tmp", copyScript),
 		"COPY (SELECT count(*) FROM __rl_result) TO '" + filepath.Join(h.work, "rowcount.csv") + "' (FORMAT CSV, HEADER false);",
 	} {

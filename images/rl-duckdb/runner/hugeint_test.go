@@ -21,7 +21,7 @@ func TestTheGeneratedCopyCastsOnlyTheWideIntegers(t *testing.T) {
 	got := copyResultSQL("/work/result.parquet", "/work/tmp/rl_copy_result.sql")
 
 	for _, want := range []string{
-		"FROM duckdb_columns() WHERE table_name = '__rl_result'",
+		"FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '__rl_result'",
 		"'HUGEINT', 'UHUGEINT'",
 		"::DECIMAL(38,0) AS ",
 		"ORDER BY column_index",
@@ -112,5 +112,42 @@ func TestAWideIntegerSumSurvivesTheParquetRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(sout), "DOUBLE") {
 		t.Errorf("units is still written as a DOUBLE: %s", strings.TrimSpace(string(sout)))
+	}
+}
+
+// A TABLE OF THE SAME NAME ELSEWHERE MUST NOT JOIN THE RESULT. Found while validating this
+// fix, on the real engine: duckdb_columns() matches by name across every attached database
+// and schema, so the first version of the filter also collected `other.__rl_result`'s
+// columns, and the generated COPY named a column the result does not have. The customer's
+// catalog is attached by the prelude, so their namespaces are where such a table lives.
+func TestASameNamedTableElsewhereDoesNotJoinTheResult(t *testing.T) {
+	bin := duckdbBinary(t)
+	work := t.TempDir()
+	tmp := filepath.Join(work, "tmp")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := filepath.Join(work, "result.parquet")
+	script := "CREATE SCHEMA other;\n" +
+		"CREATE TABLE other." + resultTable + " (evil VARCHAR);\n" +
+		"CREATE TEMP TABLE " + resultTable + " AS\n" +
+		"SELECT SUM(x) AS units FROM (SELECT " + pastTwoTo53 + "::BIGINT AS x) t\n;\n" +
+		copyResultSQL(result, filepath.Join(tmp, copyScript))
+	cmd := exec.Command(bin, "-batch", "-bail", "-no-init", "-csv", "-noheader")
+	cmd.Dir = work
+	cmd.Env = []string{"HOME=" + work, "TMPDIR=" + tmp}
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("a same-named table in another schema broke the result: %v\n%s", err, out)
+	}
+	read := exec.Command(bin, "-batch", "-bail", "-no-init", "-csv", "-noheader", "-c",
+		"SELECT string_agg(name, ',' ORDER BY name) FROM parquet_schema('"+result+"') WHERE name <> 'duckdb_schema';")
+	read.Env = []string{"HOME=" + work, "TMPDIR=" + tmp}
+	out, err := read.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading the result schema: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "units" {
+		t.Errorf("the result has columns %q, want only units — another table's columns were collected", got)
 	}
 }

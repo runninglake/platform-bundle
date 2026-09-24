@@ -499,7 +499,13 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, stmt 
 // and loadQuery refuses a statement beginning with '.' or '#' outright.
 func copyResultSQL(resultFile, scriptFile string) string {
 	var b strings.Builder
-	// The generated statement, built from the result's own catalog entry. QUOTE '' and a
+	// The generated statement, built from the result's own catalog entry — and ONLY that
+	// one. `database_name = 'temp'` is not decoration: duckdb_columns() lists every table
+	// of that name in every attached database and schema, and measured on 1.5.5 a table
+	// `other.__rl_result` beside the temp one put its columns into this statement, which
+	// then named a column the result does not have and failed the customer's query. The
+	// prelude attaches the customer's catalog, so their namespace is exactly where a
+	// same-named table would be. QUOTE '' and a
 	// delimiter that cannot occur in SQL keep the CSV writer from quoting or splitting it.
 	fmt.Fprintf(&b, `COPY (
   SELECT 'COPY (SELECT ' || string_agg(
@@ -507,7 +513,7 @@ func copyResultSQL(resultFile, scriptFile string) string {
            THEN '"' || replace(column_name, '"', '""') || '"::DECIMAL(38,0) AS "' || replace(column_name, '"', '""') || '"'
            ELSE '"' || replace(column_name, '"', '""') || '"' END, ', ' ORDER BY column_index)
     || ' FROM %s) TO %s (FORMAT PARQUET);'
-  FROM duckdb_columns() WHERE table_name = '%s'
+  FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '%s'
 ) TO %s (FORMAT CSV, HEADER false, QUOTE '', DELIMITER E'\x01');
 `, resultTable, nestedSQLString(resultFile), resultTable, sqlString(scriptFile))
 	fmt.Fprintf(&b, ".read %s\n", scriptFile)
