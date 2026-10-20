@@ -94,6 +94,7 @@ unredacted DNS or TLS failure would write a working credential for the customer'
 object into a file anybody who can read the pod can read.
 
 **Probe mode (`RL_PROBE_FILE`): a dry run of one statement on a sample, which writes nothing.**
+**A tag cut after this commit contains the probe mode, off unless `RL_PROBE_FILE` is set; the plain-query path is unchanged and tested.** Merging it is not a release: every `rl-duckdb/v*` tag is admin-only and is cut only on the owner's explicit yes.
 The control plane's change-set gates ask a plane to run an author's statement against a small
 sample of its inputs and say whether it ran, how many rows it made, how many of each output
 column were null and a digest of the output, without a row, a value or a name leaving the pod.
