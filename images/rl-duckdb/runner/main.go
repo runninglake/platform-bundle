@@ -5,6 +5,8 @@
 //
 //	RL_METRICS {"status":"succeeded","rows_out":1,...}
 //
+// (A PROBE, with RL_PROBE_FILE set, prints one more line before it, RL_PROBE, of counts and hashes: probe.go.)
+//
 // Nothing else reaches stdout or stderr. Everything the engine says goes to
 // <RL_WORK_DIR>/error.log, because a DuckDB error message quotes the SQL and can quote
 // row values, and the pod's log stream is not a place for either. The contract with the
@@ -142,6 +144,9 @@ type metrics struct {
 	// runner uploads nothing.
 	ResultUploaded bool   `json:"result_uploaded"`
 	ErrorClass     string `json:"error_class,omitempty"`
+
+	// probe is what a probe found, printed as its own RL_PROBE line before this one (emit). Never part of the metrics line.
+	probe *probeFacts
 }
 
 type config struct {
@@ -162,6 +167,11 @@ type config struct {
 	// the statement, or empty. It is never classified as the statement: it is composed,
 	// not passed through, and the agent writes it under its own ConfigMap key.
 	preludeFile string
+	// probeFile, when set, turns the run into a PROBE (probe.go): the statement runs against what the prelude sampled, nothing is copied or uploaded,
+	// and the runner prints an RL_PROBE line of counts and hashes before its metrics line. Empty is a plain query, which is every run today.
+	probeFile string
+	// probe is the spec probeFile held, set by run() once it has been read and checked.
+	probe *probeSpec
 }
 
 var (
@@ -186,6 +196,7 @@ func configFromEnv(getenv func(string) string) (config, error) {
 		initFile:  or(getenv("RL_INIT_FILE"), "/opt/duckdb/init.sql"),
 	}
 	c.preludeFile = strings.TrimSpace(getenv("RL_PRELUDE_FILE"))
+	c.probeFile = strings.TrimSpace(getenv("RL_PROBE_FILE"))
 	c.resultFile = or(getenv("RL_RESULT_FILE"), filepath.Join(c.workDir, "result.parquet"))
 	// THE UPLOAD, WHEN THE AGENT MINTED ONE. A presigned PUT and the headers its
 	// signature covers. No credential reaches this pod — automountServiceAccountToken is
@@ -246,6 +257,13 @@ func main() {
 
 // emit writes the one permitted line of stdout.
 func emit(w io.Writer, m metrics) {
+	// A PROBE'S FACTS FIRST, as their own line: the agent reads the LAST RL_METRICS line, so the facts can never be mistaken for the metrics, and a probe that
+	// failed has none. The one-line promise is for a plain query; a probe prints two.
+	if m.probe != nil {
+		if pb, err := json.Marshal(m.probe); err == nil {
+			fmt.Fprintf(w, "RL_PROBE %s\n", pb)
+		}
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		// A struct of numbers and short strings cannot fail to marshal; keep the line
@@ -291,6 +309,20 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	if err != nil {
 		note("%v", err)
 		return finish(classInvalidQuery, 1)
+	}
+	// A PROBE IS REFUSED, NEVER RUN AS A PLAIN QUERY: a spec the runner cannot understand, or a statement that makes no rows to measure, is an invalid
+	// query before the engine starts, so nothing is materialised and nothing is copied.
+	if cfg.probeFile != "" {
+		spec, err := loadProbeSpec(cfg.probeFile)
+		if err != nil {
+			note("%v", err)
+			return finish(classInvalidQuery, 1)
+		}
+		if kind == kindStatement {
+			note("a probe needs a statement that returns rows")
+			return finish(classInvalidQuery, 1)
+		}
+		cfg.probe = spec
 	}
 	initSQL, err := os.ReadFile(cfg.initFile)
 	if err != nil {
@@ -387,6 +419,16 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	if kind == kindStatement {
 		return finish("", 0)
 	}
+	// A PROBE WRITES NOTHING AND UPLOADS NOTHING: its facts are read from the engine's small files and printed by emit. There is no result file to stat.
+	if cfg.probe != nil {
+		facts, n, err := readProbe(cfg.workDir, cfg.probe)
+		if err != nil {
+			note("%v", err)
+			return finish(classRunnerIO, 1)
+		}
+		m.RowsOut, m.probe = n, facts
+		return finish("", 0)
+	}
 	rows, err := readCount(countFile)
 	if err != nil {
 		note("row count: %v", err)
@@ -461,7 +503,9 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, stmt 
 	case kindStatement:
 		fmt.Fprintf(&b, "%s\n;\n", stmt)
 	}
-	if kind != kindStatement {
+	if kind != kindStatement && cfg.probe != nil {
+		b.WriteString(probeSQL(cfg.workDir, tmpDir, cfg.probe.NameKeyHex, cfg.probe.Inputs))
+	} else if kind != kindStatement {
 		b.WriteString(copyResultSQL(cfg.resultFile, filepath.Join(tmpDir, copyScript)))
 		fmt.Fprintf(&b, "COPY (SELECT count(*) FROM %s) TO %s (FORMAT CSV, HEADER false);\n", resultTable, sqlString(countFile))
 	}
