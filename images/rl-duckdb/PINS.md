@@ -7,7 +7,7 @@ number on it; every row below was checked against the upstream artifact on the d
 shown, on x86_64 Linux.
 
 **DuckDB version:** 1.5.5 (train `2026.11`, `runtimes/2026.11/bom.yaml` in the private
-repository). **Platform:** `linux_amd64` only. **verified_on:** 2026-09-11.
+repository). **Platform:** `linux_amd64` only. **verified_on:** 2026-09-11 (the runner stage's Go row: 2026-10-23, below).
 
 ## Engine
 
@@ -56,8 +56,10 @@ Pinned by **index** digest (the multi-platform manifest list); buildx resolves t
 | Stage | Image | Index digest |
 |---|---|---|
 | engine (build only) | `public.ecr.aws/docker/library/debian:bookworm-slim` | `sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171` |
-| runner (build only) | `public.ecr.aws/docker/library/golang:1.26-bookworm` (Go 1.26.1) | `sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81` |
+| runner (build only) | `public.ecr.aws/docker/library/golang:1.26-bookworm` (Go 1.26.10) | `sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af` |
 | runtime | `gcr.io/distroless/cc-debian12:nonroot` | `sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f` |
+
+**The runner stage's Go toolchain was bumped on 2026-10-23** (a serial: a base-image bump for a CVE). `rl-duckdb/v1.5.5-6` stopped at the workflow's vulnerability scan and published nothing: the pinned builder carried Go 1.26.8, whose standard library has four HIGH advisories that the runner's binary (`net/http` for the result upload, `crypto/tls`, `crypto/x509`) links in: CVE-2026-111943, CVE-2026-78667, CVE-2026-78669 and CVE-2026-97031, fixed in 1.26.10. The Go version of both digests was read from the `linux/amd64` image config's `GOLANG_VERSION` resolved BY DIGEST (not by tag): 1.26.8 for the old, 1.26.10 for the new. (This table said Go 1.26.1 for the old digest, which was wrong.)
 
 The runtime index's `linux/amd64` manifest on the verification date was
 `sha256:777e96cf322c46bc32aca926c263624c4dc8d7cf37e2fa65ba2c7e697318ebbb`.
