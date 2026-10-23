@@ -342,16 +342,22 @@ func (s *taskSpec) writeSQL() string {
 	return b.String()
 }
 
+const (
+	asciiUpper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	asciiLower = "abcdefghijklmnopqrstuvwxyz"
+)
+
 // targetShape is the temp table that holds the target's columns and none of its rows. Reserved, like resultTable.
 const targetShape = "__rl_target"
 
 // columnCheckSQL refuses a result whose columns are not the target's, by name and in the target's order, BEFORE anything is written. Every write above matches the result to the table
 // BY POSITION (the measured form), so a SELECT that names the right columns in another order would put each value in the wrong column and raise no error unless the types differ: a
 // swapped pair of VARCHARs is stored, silently. The check reads the target's own columns through the catalog (a LIMIT 0 read into a temp table) and compares the two lists
-// case-insensitively, as the engine matches identifiers. An omitted or extra column is refused too. A mismatch is an ordinary engine error before the first write statement: not_committed.
+// case-insensitively in the ASCII range only, which is how the engine matches identifiers (SQL lower() is Unicode-aware and would fold two columns the engine keeps apart, so a swap
+// between them would pass). An omitted or extra column is refused too. A mismatch is an ordinary engine error before the first write statement: not_committed.
 func (s *taskSpec) columnCheckSQL() string {
 	cols := func(table string) string {
-		return fmt.Sprintf("(SELECT list(lower(column_name) ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '%s')", table)
+		return fmt.Sprintf("(SELECT list(translate(column_name, '%s', '%s') ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '%s')", asciiUpper, asciiLower, table)
 	}
 	return fmt.Sprintf("CREATE TEMP TABLE %s AS SELECT * FROM %s LIMIT 0;\nSELECT error('the result''s columns are not the target''s, by name and in order') WHERE %s IS DISTINCT FROM %s;\n",
 		targetShape, s.targetSQL(), cols(resultTable), cols(targetShape))

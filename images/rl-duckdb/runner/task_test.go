@@ -703,3 +703,24 @@ func TestAnIntegerBoundIsAnyInt64(t *testing.T) {
 		}
 	}
 }
+
+// The engine keeps two identifiers apart unless they differ in ASCII case alone, so the check does too: SQL lower() would fold a Greek capital and small sigma together and let a swap through.
+func TestTheColumnCheckFoldsOnlyASCIICaseAsTheEngineDoes(t *testing.T) {
+	r := newTaskRig(t)
+	r.seed(`CREATE TABLE "a.b".u ("Σ" VARCHAR, "σ" VARCHAR)`)
+	spec := `{"v":2,"attempt":"att-1","mode":"append","target":{"warehouse":"wh","namespace":["a","b"],"name":"u"},"base_snapshot_id":"4711"}`
+	m, code, lines := r.run(spec, `SELECT 'x' AS "σ", 'y' AS "Σ"`, nil)
+	if code == 0 || m.Status != "failed" {
+		t.Fatalf("a swap between two columns that lower() folds together was written: %+v code %d", m, code)
+	}
+	wantClaim(t, lines, "not_committed")
+	if got := r.cli(`SELECT count(*) FROM "a.b".u`); got != "0" {
+		t.Errorf("the table holds %s rows", got)
+	}
+	// The same columns in order are written.
+	_, code, lines = r.run(spec, `SELECT 'x' AS "Σ", 'y' AS "σ"`, nil)
+	if code != 0 {
+		t.Fatalf("exit %d: %q", code, lines)
+	}
+	wantClaim(t, lines, "committed")
+}
