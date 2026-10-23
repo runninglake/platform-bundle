@@ -36,6 +36,9 @@ func fakeDuckDB() int {
 	_ = os.WriteFile(filepath.Join(home, "fake_env"), []byte(strings.Join(os.Environ(), "\n")), 0o644)
 	modeBytes, _ := os.ReadFile(filepath.Join(home, "fake_mode"))
 	mode := strings.TrimSpace(string(modeBytes))
+	if strings.HasPrefix(mode, "task_") {
+		return fakeTaskEngine(mode, string(script), home)
+	}
 
 	sentinel := func() { fmt.Println(initSentinel) }
 	// The engine executes the prelude's sentinel SELECT like any other; the fake echoes
