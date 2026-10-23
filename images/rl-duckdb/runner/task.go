@@ -83,7 +83,7 @@ var taskModes = map[string]bool{"append": true, "overwrite": true, "partition_ov
 var (
 	reTaskAttempt  = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 	reTaskBase     = regexp.MustCompile(`^[0-9]{1,19}$`)
-	reTaskInteger  = regexp.MustCompile(`^-?[0-9]{1,18}$`)
+	reTaskInteger  = regexp.MustCompile(`^-?[0-9]{1,19}$`)
 	reTaskDate     = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
 	reCatalogToken = regexp.MustCompile(`^[A-Za-z0-9._~+/=-]+$`)
 )
@@ -230,7 +230,8 @@ func (p *taskPartition) validate() error {
 func (v *taskValue) validate() error {
 	switch v.Kind {
 	case "integer":
-		if !reTaskInteger.MatchString(v.Value) {
+		// Any int64 the agent can write: the grammar keeps a fragment out, ParseInt keeps a number past the range out.
+		if _, err := strconv.ParseInt(v.Value, 10, 64); err != nil || !reTaskInteger.MatchString(v.Value) {
 			return errors.New("task spec: an integer bound is not an integer")
 		}
 	case "date":
@@ -310,6 +311,7 @@ func (s *taskSpec) skippable() bool { return s.Mode == "append" || s.Mode == "me
 func (s *taskSpec) writeSQL() string {
 	var b strings.Builder
 	t := s.targetSQL()
+	b.WriteString(s.columnCheckSQL())
 	switch s.Mode {
 	case "merge":
 		keys := make([]string, len(s.UniqueKey))
@@ -338,6 +340,21 @@ func (s *taskSpec) writeSQL() string {
 	}
 	fmt.Fprintf(&b, "SELECT '%s';\n", writeCommittedSentinel)
 	return b.String()
+}
+
+// targetShape is the temp table that holds the target's columns and none of its rows. Reserved, like resultTable.
+const targetShape = "__rl_target"
+
+// columnCheckSQL refuses a result whose columns are not the target's, by name and in the target's order, BEFORE anything is written. Every write above matches the result to the table
+// BY POSITION (the measured form), so a SELECT that names the right columns in another order would put each value in the wrong column and raise no error unless the types differ: a
+// swapped pair of VARCHARs is stored, silently. The check reads the target's own columns through the catalog (a LIMIT 0 read into a temp table) and compares the two lists
+// case-insensitively, as the engine matches identifiers. An omitted or extra column is refused too. A mismatch is an ordinary engine error before the first write statement: not_committed.
+func (s *taskSpec) columnCheckSQL() string {
+	cols := func(table string) string {
+		return fmt.Sprintf("(SELECT list(lower(column_name) ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '%s')", table)
+	}
+	return fmt.Sprintf("CREATE TEMP TABLE %s AS SELECT * FROM %s LIMIT 0;\nSELECT error('the result''s columns are not the target''s, by name and in order') WHERE %s IS DISTINCT FROM %s;\n",
+		targetShape, s.targetSQL(), cols(resultTable), cols(targetShape))
 }
 
 // writeFiles writes the two scripts the engine `.read`s and returns the tail of the main script: the row count, then the choice between them. The files are the runner's own, under

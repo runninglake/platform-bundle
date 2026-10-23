@@ -660,3 +660,46 @@ func TestAPlainQueryIsUntouchedByTaskMode(t *testing.T) {
 		t.Errorf("a plain query's script carries task mode:\n%s", s)
 	}
 }
+
+// THE WRITES MATCH COLUMNS BY POSITION (the measured form), so the runner first refuses a result whose columns are not the target's, by name and in the target's order: a SELECT that
+// names the right columns in another order would otherwise put each value in the wrong column, and the engine raises no error when the types agree.
+func TestAResultWhoseColumnsAreNotTheTargetsIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	part := `"partition":{"column":"d","start":{"kind":"date","value":"2026-09-02"}}`
+	for _, tc := range []struct{ name, query string }{
+		{"two columns swapped", `SELECT 3 AS id, DATE '2026-09-02' AS d, 'B3' AS v, TIMESTAMP '2026-09-02 10:00:00' AS ts`},
+		{"a column missing", `SELECT 3 AS id, DATE '2026-09-02' AS d, TIMESTAMP '2026-09-02 10:00:00' AS ts`},
+		{"a column too many", `SELECT 3 AS id, DATE '2026-09-02' AS d, TIMESTAMP '2026-09-02 10:00:00' AS ts, 'x' AS v, 1 AS extra`},
+		{"a column renamed", `SELECT 3 AS id, DATE '2026-09-02' AS d, TIMESTAMP '2026-09-02 10:00:00' AS ts, 'x' AS value`},
+	} {
+		for _, mode := range []struct{ mode, extra string }{
+			{"append", ""}, {"overwrite", ""}, {"merge", `"unique_key":["id"]`}, {"partition_overwrite", part},
+		} {
+			r := newTaskRig(t)
+			r.seed(`INSERT INTO "a.b".t VALUES (1, DATE '2026-09-02', NULL, 'keep')`)
+			m, code, lines := r.run(taskSpecJSON(mode.mode, mode.extra), tc.query, nil)
+			if code == 0 || m.Status != "failed" {
+				t.Errorf("%s / %s: metrics = %+v code %d, want a failure", tc.name, mode.mode, m, code)
+			}
+			wantClaim(t, lines, "not_committed")
+			if got := r.rows(); got != "1,2026-09-02,,keep" {
+				t.Errorf("%s / %s: table = %q, want it untouched", tc.name, mode.mode, got)
+			}
+		}
+	}
+	// The engine matches identifiers without regard to case, and so does the check.
+	r := newTaskRig(t)
+	_, code, lines := r.run(taskSpecJSON("append", ""), `SELECT 3 AS "ID", DATE '2026-09-02' AS "D", NULL::TIMESTAMP AS "Ts", 'x' AS "V"`, nil)
+	if code != 0 {
+		t.Fatalf("exit %d: %q", code, lines)
+	}
+	wantClaim(t, lines, "committed")
+}
+
+func TestAnIntegerBoundIsAnyInt64(t *testing.T) {
+	for v, ok := range map[string]bool{"9223372036854775807": true, "-9223372036854775808": true, "9223372036854775808": false, "1000000000000000000": true, "12345678901234567890": false, "": false, "-": false} {
+		err := (&taskValue{Kind: "integer", Value: v}).validate()
+		if (err == nil) != ok {
+			t.Errorf("integer %q: validate = %v, want ok=%v", v, err, ok)
+		}
+	}
+}
