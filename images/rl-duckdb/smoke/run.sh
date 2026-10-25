@@ -53,6 +53,14 @@ run_case count count.sql succeeded - 0 --network none --tmpfs /work:rw,size=1g,m
 [[ "$(jq -r .result_bytes <<<"$LAST_JSON")" -gt 0 ]] || { echo "  result_bytes == 0"; FAILED=1; }
 COUNT_JSON="$LAST_JSON"
 
+# bytes_scanned is the engine's own count of the bytes it READ (runner/main.go, bytesReadSQL), and only when RL_MEASURE_BYTES=1. Zero for a query over range(), which reads no
+# file; off, zero for everything.
+run_case count_measured count.sql succeeded - 0 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120 -e RL_MEASURE_BYTES=1
+[[ "$(jq -r .bytes_scanned <<<"$LAST_JSON")" == 0 ]] || { echo "  bytes_scanned != 0 for a query that reads no file"; FAILED=1; }
+[[ "$(jq -r .rows_out <<<"$LAST_JSON")" == 1 ]] || { echo "  rows_out != 1 while measuring"; FAILED=1; }
+# The same failures keep their kind while measuring (the engine's coloured warning once turned each into runner_io_error).
+run_case catalog_error_measured catalog_error.sql failed catalog_error 1 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120 -e RL_MEASURE_BYTES=1
+
 run_case statement statement.sql succeeded - 0 --network none --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=120
 [[ "$(jq -r .rows_out <<<"$LAST_JSON")" == 0 ]] || { echo "  rows_out != 0 for a non-query"; FAILED=1; }
 
@@ -68,6 +76,9 @@ run_case timeout timeout.sql failed query_timeout 2 --network none --tmpfs /work
 
 run_case https https.sql succeeded - 0 --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=300
 [[ "$(jq -r .rows_out <<<"$LAST_JSON")" == 1 ]] || { echo "  rows_out != 1"; FAILED=1; }
+# A count over a remote Parquet file reads at least its footer through the HTTP file system, and that read is in the engine's log, which is on here and not above.
+run_case https_measured https.sql succeeded - 0 --tmpfs /work:rw,size=1g,mode=1777 -e RL_TIMEOUT_SECONDS=300 -e RL_MEASURE_BYTES=1
+[[ "$(jq -r .bytes_scanned <<<"$LAST_JSON")" -gt 0 ]] || { echo "  bytes_scanned == 0 for a query that read a remote file"; FAILED=1; }
 
 # The result file: written by one run into a bind-mounted /work, read back by a second
 # run of the same image, which errors unless the values are right.
