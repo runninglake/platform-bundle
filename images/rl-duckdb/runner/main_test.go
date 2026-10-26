@@ -40,7 +40,16 @@ func fakeDuckDB() int {
 		return fakeTaskEngine(mode, string(script), home)
 	}
 
-	sentinel := func() { fmt.Println(initSentinel) }
+	// THE REAL CLI'S COLOURED WARNING when logging is switched on: it goes to stdout, and its closing escape sequence lands on the front of the next line, which is the init
+	// sentinel. A fake that stays silent here is how a runner that cannot read its own sentinel passed every test (the review of 2026-10-24).
+	warned := strings.Contains(string(script), "enable_logging(")
+	sentinel := func() {
+		if warned {
+			fmt.Print("\x1b[90mWARNING:\nThe logging settings have been changed so you may lose warnings printed in the CLI.\nFor more info see https://duckdb.org/docs/stable/operations_manual/logging/overview.\n\n\x1b[00m")
+			warned = false
+		}
+		fmt.Println(initSentinel)
+	}
 	// The engine executes the prelude's sentinel SELECT like any other; the fake echoes
 	// it whenever the script carries it, except in the mode that fails inside the prelude.
 	preludeSentinelIfPresent := func() {
@@ -92,6 +101,21 @@ func fakeDuckDB() int {
 	if m := regexp.MustCompile(`TO ''([^']+)'' \(FORMAT PARQUET\);`).FindStringSubmatch(s); m != nil {
 		_ = os.WriteFile(m[1], []byte("PAR1 fake parquet bytes PAR1"), 0o644)
 	}
+	// THE BYTES THE ENGINE'S LOG SUMMED: the real engine writes one integer to the file the script names; this fake writes what fake_bytes holds (0 when it holds nothing),
+	// nothing at all for "absent", and a line that is not a number for "garbage".
+	if m := regexp.MustCompile(`COPY \(SELECT coalesce\(sum\(TRY_CAST[^;]*TO '([^']+)' \(FORMAT CSV, HEADER false\);`).FindStringSubmatch(s); m != nil {
+		v := "0"
+		if b, err := os.ReadFile(filepath.Join(home, "fake_bytes")); err == nil {
+			v = strings.TrimSpace(string(b))
+		}
+		switch v {
+		case "absent":
+		case "garbage":
+			_ = os.WriteFile(m[1], []byte("not a number\n"), 0o644)
+		default:
+			_ = os.WriteFile(m[1], []byte(v+"\n"), 0o644)
+		}
+	}
 	if m := regexp.MustCompile(`COPY \(SELECT count\(\*\) FROM __rl_result\) TO '([^']+)' \(FORMAT CSV, HEADER false\);`).FindStringSubmatch(s); m != nil {
 		_ = os.WriteFile(m[1], []byte(rows+"\n"), 0o644)
 	} else {
@@ -140,6 +164,13 @@ func newHarness(t *testing.T, sql string, env map[string]string) *harness {
 		t.Fatalf("configFromEnv: %v", err)
 	}
 	return &harness{t: t, work: work, cfg: cfg}
+}
+
+// bytes sets what the fake engine's summed file-system log comes to: a number, "absent" for no file, "garbage" for a line that is not one.
+func (h *harness) bytes(v string) {
+	if err := os.WriteFile(filepath.Join(h.work, "fake_bytes"), []byte(v), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 func (h *harness) mode(m string) {
@@ -486,6 +517,8 @@ func TestConfigValidation(t *testing.T) {
 		{"RL_MEMORY_LIMIT": "512MB'; SET x"},
 		{"RL_TIMEOUT_SECONDS": "-1"},
 		{"RL_TIMEOUT_SECONDS": "ten"},
+		{"RL_MEASURE_BYTES": "yes"},
+		{"RL_MEASURE_BYTES": "0"},
 	}
 	for _, env := range bad {
 		if _, err := configFromEnv(func(k string) string { return env[k] }); err == nil {
@@ -500,8 +533,11 @@ func TestConfigValidation(t *testing.T) {
 	if cfg.timeout != 0 || cfg.memoryLimit != "1.5 GiB" || cfg.threads != "16" {
 		t.Errorf("config = %+v", cfg)
 	}
-	if cfg.queryFile != "/run/rl/query.sql" || cfg.workDir != "/work" || cfg.resultFile != "/work/result.parquet" {
-		t.Errorf("defaults = %+v", cfg)
+	if cfg.queryFile != "/run/rl/query.sql" || cfg.workDir != "/work" || cfg.resultFile != "/work/result.parquet" || cfg.measureBytes {
+		t.Errorf("defaults = %+v (the bytes measurement is off unless RL_MEASURE_BYTES=1)", cfg)
+	}
+	if on, err := configFromEnv(func(k string) string { return map[string]string{"RL_MEASURE_BYTES": "1"}[k] }); err != nil || !on.measureBytes {
+		t.Errorf("RL_MEASURE_BYTES=1 turns the measurement on: %+v %v", on, err)
 	}
 }
 

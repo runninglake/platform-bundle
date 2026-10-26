@@ -66,6 +66,7 @@ and this environment:
 | `RL_THREADS` | DuckDB `threads` |
 | `RL_MEMORY_LIMIT` | DuckDB `memory_limit`, e.g. `512MB` |
 | `RL_TIMEOUT_SECONDS` | wall-clock limit; the engine is killed at it. Unset or `0`: no runner-side limit, the pod's `activeDeadlineSeconds` is the only one |
+| `RL_MEASURE_BYTES` | `1` turns on the engine's file-system log and reports `bytes_scanned` from it (see the metrics line, below); empty or unset: off, `bytes_scanned` is 0 and the script is what it always was. Anything else is refused |
 | `RL_RESULT_UPLOAD_URL` | a presigned `PUT` the result is sent to. Absent: the result stays in the emptyDir and dies with the pod |
 | `RL_RESULT_UPLOAD_HEADERS` | a JSON object of headers the presigned signature covers, sent verbatim. Required with the URL; a URL without it is treated as no upload |
 | `RL_PROBE_FILE` | a JSON file that turns the run into a **probe** (below): `{"name_key_hex":"<16 to 32 bytes as hex>","inputs":["inp_<8 to 64 letters and digits>", ...]}`. Absent: a plain query, which is every run before the mode existed |
@@ -197,10 +198,32 @@ The runner:
    ran, e.g. an extension did not load), `invalid_query_file` (any refusal in step 1, or
    a missing file). `cpu_core_seconds` is user+system CPU of the engine process,
    `peak_memory_bytes` its maximum resident set (`ru_maxrss`), `wall_seconds` the runner's
-   own wall clock, `result_bytes` the size of the Parquet file. **`bytes_scanned` is
-   always 0 in this version**: DuckDB exposes no per-query byte counter the runner can
-   read without a profiling mode that the configuration lock forbids the statement from
-   enabling; it is a placeholder for a later serial.
+   own wall clock, `result_bytes` the size of the Parquet file. **`bytes_scanned` is 0 unless the
+   pod sets `RL_MEASURE_BYTES=1`** (tracker 8.14.103), and the script a plain query gets is then exactly what it
+   always was. With it set, the runner switches on the engine's file-system log before
+   `SET lock_configuration=true` (`CALL enable_logging('FileSystem', storage='memory')`),
+   empties it after the prelude's sentinel so init, the extension loads and the prelude are not counted
+   (`CALL truncate_duckdb_logs()`), and after the statement writes the sum of the bytes of every READ
+   outside `RL_WORK_DIR` to `bytes_read.csv`, which it reads into `bytes_scanned`; zero for a query that
+   reads no file (`range()`, `SELECT 1`), and a write is never in it. The sum reads each log message with a
+   pattern, never as JSON (the log writes a path into it unescaped), from `system.main.duckdb_logs` (a temp
+   view of the same name does not stand in for it). A figure it cannot read back leaves 0 and puts one line in
+   `error.log`; it never fails the query. The CLI's coloured WARNING that logging was switched on is stdout
+   noise the sentinel check ignores. **Why the log and not the engine's profile:** measured on the pinned 1.5.5
+   CLI, the profile's query-level `total_bytes_read` said 19,145 for a statement that read two of four columns
+   of a 24.5 MB Parquet file and the TABLE_SCAN operator carries no byte figure, while the log's READ bytes
+   summed to 16,150,735 against 16,001,333 compressed bytes for the wide column read (16,180,293 through the
+   HTTP file system for the same query). **What it is, and why it is not on for every query:** the bytes asked
+   of the files, so a file a query scans twice counts twice (32,012,325 against 16,011,383 for one scan) and the
+   footer and page headers are in it; the log is held in memory outside `memory_limit`, one row for each OPEN and
+   READ (20,000 tiny files cost about 130 MB more and half again the wall time, measured by the review);
+   and a statement can reconfigure it (`lock_configuration` does not forbid `enable_logging`), shadow its view
+   or write a line of its choosing into it, so the figure from a statement a customer wrote is not a floor, not a
+   ceiling and not something to meter or bill. It is for the engine-profile harness, which runs its own fixed
+   statements on a sample. Proved by `runner/bytes_test.go`, which runs the real pinned CLI (on PATH, as the
+   release job installs it): the figure for a two-of-four-column scan, error kinds kept while measuring, file
+   names with a quote, a backslash or a tab, a shadowing view, the work directory and its neighbour; and by
+   `smoke/run.sh`, which asserts zero for a `range()` query and above zero for a remote file, with the flag on.
 4. Exits 0 on `succeeded`, 1 on `failed`, 2 on `query_timeout`.
 
 **Task mode (`RL_TASK_FILE`): one write of a pipeline task, composed here from a spec file, and a claim of what it did.**
@@ -211,7 +234,7 @@ The runner:
 - **Checks before anything is written**, because the engine enforces none of them: **the result's columns are the target's, by name (ASCII case-insensitively) and in the target's order** (the writes match by position, and the engine raises no error when two swapped columns have the same type; the target's columns are read through the catalog with a `LIMIT 0` read into a temp table, so a missing, extra, renamed or reordered column is refused, comparing names with ASCII case folded only, as the engine does; a result column the engine had to rename because the statement named it twice (`a`, `a_1`) can still line up with a target of those names; `BY NAME` forms were not used because they are unmeasured on Iceberg); a merge's source holds each key once and none is `NULL` (the measured engine refuses a duplicate only for a key already in the table and lands a duplicate new key twice), and a partition overwrite's result holds no row outside the partition it replaces, `NULL` included. A refusal is an ordinary engine error before the first write statement: `not_committed`. The claims depend on the CLI's stdout being flushed at exit; if the work volume is full and the flush fails, a `not_committed` or `unknown` claim can be lost, which is safe (the agent rolls back any head past the base that no `committed` claim covers), and the `committed` claim is printed only after the commit returned.
 - **The claim.** Directly before the `RL_METRICS` line the runner prints one `RL_TASK {"v":1,"attempt":"...","outcome":"...","base_snapshot_id":"...","committed_snapshot_id":"0","files_written":0,"bytes_written":0}`. The outcome is how far the script got, from sentinels it prints: `committed` (the `COMMIT`, or the one statement, returned), `no_change` (nothing was to be written), `not_committed` (the engine failed before any write statement, or inside a transaction before `COMMIT` was sent) or `unknown` (it failed after a statement that may have committed, or after `COMMIT` was sent, or the engine was killed or timed out, which may lose the sentinels). **The runner does not name the snapshot it committed and does not count files or bytes**: DuckDB gives it neither in a form it can trust, and the agent reads the table after the Job ends and decides from the catalog. `"0"` is none. The base is the spec's, echoed. **The runner does not compare the table's snapshot with the base before it writes**; the agent refuses a moved table at acceptance and proves the outcome after the Job. The agent must accept a `committed` claim with snapshot id `"0"` (its own change, owed).
 - **The catalog token.** When `RL_CATALOG_TOKEN_FILE` names a file, the runner makes `CREATE SECRET rl_catalog_token (TYPE iceberg, TOKEN '<token>')` itself, after `SET lock_configuration=true` and the init sentinel and before the prelude, whose `ATTACH` finds the one iceberg secret by default (measured to work after the lock, so no new tag; a *named* secret with no `SECRET` clause in the `ATTACH` is the form `m64` measured, an explicit `SECRET` clause is unmeasured). The token is checked against `[A-Za-z0-9._~+/=-]`, 8 to 8192 bytes, and quoted; a file that does not hold one is `runner_io_error` and the engine does not run. The token is on the engine's stdin and in no file, no environment variable, no log line and no output. The split was agreed with E06-BE on 2026-10-22: the control plane's prelude carries no secret and no `ATTACH`, the agent prepends the `ATTACH`, the runner makes the secret.
-- **Not done.** No upload and no result file (a task's result is the table); `bytes_scanned` stays 0; a task and a probe together are refused.
+- **Not done.** No upload and no result file (a task's result is the table); a task and a probe together are refused. With `RL_MEASURE_BYTES=1`, `bytes_scanned` is what the `SELECT` read, as for a query: the write that follows is not a read and is not in it.
 
 Everything the engine writes to stderr goes to `<RL_WORK_DIR>/error.log`, never to the
 pod's log stream, because a DuckDB error quotes the SQL and can quote row values. The
