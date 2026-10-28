@@ -37,6 +37,12 @@ func dotShapes() []dotShape {
 		{"a CRLF line end", "SELECT E'\\';\r\n.shell touch {M}\r\n' AS a"},
 		{"a dot line in a DESCRIBE", "DESCRIBE SELECT E'\\';\n.shell touch {M}\n' AS a"},
 		{"a dot line in a statement that is run as it is", "SET VARIABLE v = E'\\';\n.shell touch {M}\n'"},
+		// The four disagreements E02-Backend's reviewer found between the CLI's scanner and DuckDB's lexer (2026-10-28): the first is the E string above. The CLI cuts the
+		// statement at a `;` inside an unclosed parenthesis and closes a block comment at the first `*/` however deeply it nests; a line comment ended by a bare CR is the fourth.
+		{"a semicolon inside an unclosed parenthesis", "SELECT (1;\n.shell touch {M}\n)"},
+		{"a block comment nested in a block comment, closed at the first */", "SELECT 1 /* a /* b */ ;\n.shell touch {M}\n*/"},
+		{"a line comment ended by a bare CR, then a semicolon", "SELECT 1 -- c\r;\n.shell touch {M}\n"},
+		{"a line comment ended by a bare CR, then the dot line", "SELECT 1 -- c\r.shell touch {M}\n"},
 	}
 }
 
@@ -94,6 +100,7 @@ func TestADotThatIsNotACommandIsStillAccepted(t *testing.T) {
 		"an indented dot-like line":          "SELECT 'a\n  .shell id\n' AS x",
 		"a dotted name":                      "SELECT a.b FROM c.d.e",
 		"a float":                            "SELECT 1.5, .5e3",
+		"a # at a line start is a positional reference, not a command (measured: the CLI takes no such line as one)": "SELECT\n#1 FROM (SELECT 1 AS x)",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := loadQuery(writeQuery(t, sql)); err != nil {
@@ -121,5 +128,45 @@ func TestTheBareCLIRunsTheDotLineAfterAnEStringTheRunnerReadsAsOneStatement(t *t
 	_, _ = cmd.CombinedOutput() // the cut-off statement fails, and that is expected
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("the bare CLI no longer runs the dot line after the cut-off statement (%v): the differential is gone or the control is wrong", err)
+	}
+}
+
+// WHICH OF THE SHAPES THE BARE CLI RUNS, AND THAT `-c` RUNS NONE (measured 2026-10-28 on 1.5.5, as depth and not as the runner's way). The runner feeds the engine one script on stdin;
+// `duckdb -c "<sql>"` hands the whole string to the SQL parser, where a line starting with a dot is a syntax error and never a command, even after a real statement boundary.
+// The runner cannot become one `-c` without a redesign (its own steps are dot-commands: `.bail`, `.read`), but a statement could be its own `-c` argument. This test records
+// both facts so a new engine that changes either is seen: the shapes that run on stdin without -bail, and none that runs as `-c`.
+func TestOnlyStdinRunsADotLineAndDashCNeverDoes(t *testing.T) {
+	bin := duckdbBinary(t)
+	run := func(args []string, stdin, work string) {
+		cmd := exec.Command(bin, append([]string{"-batch", "-no-init", "-csv", "-noheader"}, args...)...)
+		cmd.Dir = work
+		cmd.Env = []string{"HOME=" + work, "TMPDIR=" + work}
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		_, _ = cmd.CombinedOutput() // a statement the CLI cut off fails, which is expected
+	}
+	// The ones that ran on stdin when this was measured. A4's two shapes did not (a bare CR does not end a comment for the CLI on 1.5.5); the runner refuses them anyway.
+	runsOnStdin := map[string]bool{
+		"E string with an escaped quote, then a dot line":                   true,
+		"a semicolon inside an unclosed parenthesis":                        true,
+		"a block comment nested in a block comment, closed at the first */": true,
+	}
+	for _, s := range dotShapes() {
+		t.Run(s.name, func(t *testing.T) {
+			work := t.TempDir()
+			sql := strings.ReplaceAll(s.sql, "{M}", filepath.Join(work, "marker"))
+			run(nil, "CREATE TEMP TABLE r AS\n"+sql+"\n;\n", work)
+			_, ran := os.Stat(filepath.Join(work, "marker"))
+			if want := runsOnStdin[s.name]; want && ran != nil {
+				t.Errorf("stdin, no -bail: the dot line no longer runs for this shape (%v): the differential moved, look at the rule again", ran)
+			}
+			work2 := t.TempDir()
+			sql2 := strings.ReplaceAll(s.sql, "{M}", filepath.Join(work2, "marker"))
+			run([]string{"-c", "CREATE TEMP TABLE r AS\n" + sql2 + "\n;\n"}, "", work2)
+			if _, err := os.Stat(filepath.Join(work2, "marker")); err == nil {
+				t.Errorf("-c ran a dot line: the premise of using it as depth is gone")
+			}
+		})
 	}
 }
