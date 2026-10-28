@@ -778,7 +778,32 @@ func loadQuery(path string) (string, stmtKind, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	if err := refuseDotLines(stmt); err != nil {
+		return "", 0, err
+	}
 	return stmt, kind, nil
+}
+
+// refuseDotLines refuses a statement with a line that begins with a dot and then something that is not a digit. THE CLI TAKES SUCH A LINE AS A COMMAND, `.shell` AND `.read`
+// AMONG THEM, WHENEVER IT SEES THE STATEMENT BEFORE IT AS COMPLETE, and this runner feeds it one script on stdin. What keeps a statement's own lines from being read that way is
+// that the runner and the CLI agree where the statement ends, and they do not always: measured on 1.5.5, DuckDB's parser reads E'\” as one string with an escaped quote and
+// the CLI's scanner, which has no backslash escape, closes it at the backslash, so the `;` after it ends a statement and a `.shell` line after that ran (it is a syntax error
+// first, and -bail stops the script before the dot line, which is why nothing ran here: a safety that is an accident of one flag is not a rule). The CLI reads a command only at
+// column 0 (a leading space, tab, vertical tab, form feed, no-break space and byte-order mark each leave a line as SQL; measured), so no line of a statement may start there with
+// a dot. A line may begin with a digit after the dot, `.5` being a number, which the CLI never takes as a command with a statement open and which no command is called. A carriage
+// return counts as a line end too: the CLI does not take one as such, and refusing past it costs nothing. The cost of the rule is a statement refused that was data: a line
+// inside a multi-line string literal that starts with a dot. The reason is the same sentence for every one of them and carries none of the statement.
+func refuseDotLines(stmt string) error {
+	for i := 0; i < len(stmt); i++ {
+		if stmt[i] != '.' || (i > 0 && stmt[i-1] != '\n' && stmt[i-1] != '\r') {
+			continue
+		}
+		if i+1 < len(stmt) && stmt[i+1] >= '0' && stmt[i+1] <= '9' {
+			continue
+		}
+		return errors.New("statement has a line that begins with a dot, which the CLI would take as a command")
+	}
+	return nil
 }
 
 type stmtKind int

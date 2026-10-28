@@ -444,6 +444,15 @@ func TestInvalidQueryFiles(t *testing.T) {
 		"dot command after comment": "-- c\n.shell id",
 		"hash line":                 "#\n.shell id",
 		"nul byte":                  "\x00\n.shell id",
+		// A dot line INSIDE what the runner reads as one statement (dotcommand_test.go runs them on the real engine).
+		"dot line in a string":         "SELECT 'a\n.shell id\n'",
+		"dot line in a comment":        "SELECT 1 /* a\n.shell id\n*/",
+		"dot line after an E string":   "SELECT E'\\'; \n.shell id\n' AS a",
+		"dot line after a line":        "SELECT 1\n.shell id",
+		"dot line after CRLF":          "SELECT E'\\';\r\n.system id\r\n' AS a",
+		"dot line after a bare CR":     "SELECT 1\r.sh id",
+		"a dot alone on a line":        "SELECT 1\n.\n",
+		"a dot then a letter, in DESC": "DESCRIBE SELECT 'a\n.read x\n'",
 	}
 	for name, sql := range cases {
 		h := newHarness(t, sql, nil)

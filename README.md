@@ -153,7 +153,19 @@ The runner:
    more than one statement (a `;` outside a string, quoted identifier, dollar-quoted
    string or comment, followed by anything but whitespace, comments or more `;`), one
    containing a NUL byte, and one whose first significant character is `.` or `#`
-   (the DuckDB CLI would take that line as a command rather than SQL). Leading
+   (the DuckDB CLI would take that line as a command rather than SQL), and one with ANY
+   line that begins with a `.` and then something that is not a digit (`.5` is a number).
+   The CLI runs a dot-command, `.shell` and `.read` among them, at column 0 when the statement
+   before it is complete, and the runner's lexer (DuckDB's) and the CLI's scanner (no backslash
+   escape) do not always agree where a statement ends: measured on 1.5.5, `SELECT E'\'; ⏎ .shell
+   touch M ⏎ ' AS a` is one statement to the runner and two to the CLI, and the `.shell` line RAN on
+   the bare CLI. It did not run here only because the cut-off statement is a syntax error and
+   `-bail` stops the script first, which is an accident of one flag, so the line rule is the
+   guard (`runner/dotcommand_test.go` runs 14 shapes through the real pinned CLI, and a control
+   shows the bare CLI running the line). It costs a refusal of a multi-line string literal one of
+   whose lines starts with a dot. **`.safe_mode` is not the alternative:** measured on 1.5.5 it
+   refuses `.read`, which this runner runs after the statement for the generated `COPY` and a
+   task's scripts, and turns SQL file access off, which the result `COPY` needs. Leading
    whitespace and comments and a trailing `;` are stripped.
 2. Feeds the DuckDB CLI (`-batch -bail -no-init -csv -noheader`) one script on stdin:
    `init.sql` (extension directory, `autoinstall_known_extensions=false`,
