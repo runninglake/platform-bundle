@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +109,16 @@ func pgWith(key, jsonValue string) string {
 		}
 	}
 	return `{"v":1,"bindings":[{` + strings.Join(parts, ",") + `}]}`
+}
+
+// realDir is a directory with its symlinks resolved, which is the spelling the runner puts in allowed_directories (a laptop's temporary directory is behind a link).
+func realDir(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 func jq(s string) string { b, _ := json.Marshal(s); return string(b) }
@@ -545,7 +556,7 @@ func TestAnAccessDirectoryThatIsASymlinkToWhatTheRunnerProtectsIsRefused(t *test
 func TestAnAccessURLPrefixIsAnObjectStorePrefixAndNothingElse(t *testing.T) {
 	r := newBindRig(t)
 	for _, p := range []string{
-		"s3://bkt/runninglake/prj/env/", "gs://bkt/a/", "abfss://container@account.dfs.core.windows.net/p/e/", "s3://bkt/", "s3://my-bucket.v2/a_b/c=d/", "s3://bkt/a.b/c-d/",
+		"s3://bkt/runninglake/prj/env/", "gs://bkt/a/", "s3://bkt/", "s3://my-bucket.v2/a_b/c=d/", "s3://bkt/a.b/c-d/",
 	} {
 		if _, err := loadFrom(r, accessDoc(nil, []string{p}), nil); err != nil {
 			t.Errorf("prefix %q refused: %v", p, err)
@@ -554,7 +565,7 @@ func TestAnAccessURLPrefixIsAnObjectStorePrefixAndNothingElse(t *testing.T) {
 	for _, p := range []string{
 		"http://example.com/", "https://example.com/", "https://catalog.internal/catalog/", "http://127.0.0.1:8080/", "file:///etc/", "s3://bkt", "s3://bkt/a", "s3://", "s3:///a/",
 		"s3://bkt/a/../b/", "s3://bkt/a//b/", "s3://bkt/./a/", "s3://bkt/a b/", "s3://bkt/a?x=1/", "s3://bkt/a#x/", "s3://bkt/a%2e%2e/", "S3://bkt/", "s3://bkt/\u00e9/", "s3://bkt/a\n/",
-		"s3://bkt/a'/", "s3://bkt/a\\b/", "az://c/", "hdfs://nn/", "", "/run/rl/", "s3://u:p@bkt/", "s3://bkt:80/", "s3://bkt/" + strings.Repeat("a", 1100) + "/",
+		"s3://bkt/a'/", "s3://bkt/a\\b/", "az://c/", "hdfs://nn/", "abfss://container@account.dfs.core.windows.net/p/e/", "abfs://c@a.dfs.core.windows.net/p/", "", "/run/rl/", "s3://u:p@bkt/", "s3://bkt:80/", "s3://bkt/" + strings.Repeat("a", 1100) + "/",
 	} {
 		if _, err := loadFrom(r, accessDoc(nil, []string{p}), nil); err == nil {
 			t.Errorf("prefix %q accepted", p)
@@ -787,7 +798,7 @@ func TestTheScriptWithADescriptorRestrictsBeforeTheLockAndMakesTheSecretsAfterIt
 		}
 		return i
 	}
-	allowed := fmt.Sprintf("SET allowed_directories=['%s', '%s/', 's3://bkt/runninglake/p/e/'];\n", h.work, data)
+	allowed := fmt.Sprintf("SET allowed_directories=['%s', '%s/', 's3://bkt/runninglake/p/e/'];\n", realDir(t, h.work), data)
 	ord := []int{
 		at("SET temp_directory="), at("SET memory_limit="),
 		at("SET allow_persistent_secrets=false;\n"), at(allowed), at("SET enable_external_access=false;\n"),
@@ -828,7 +839,7 @@ func TestAnAbsentAccessStillRestrictsToTheWorkAndResultDirectories(t *testing.T)
 	}
 	s := h.script()
 	for _, want := range []string{
-		"SET allow_persistent_secrets=false;\n", fmt.Sprintf("SET allowed_directories=['%s', '%s'];\n", h.work, resultDir), "SET enable_external_access=false;\n",
+		"SET allow_persistent_secrets=false;\n", fmt.Sprintf("SET allowed_directories=['%s', '%s'];\n", realDir(t, h.work), realDir(t, resultDir)), "SET enable_external_access=false;\n",
 		"SET lock_configuration=true;\n", "SELECT '" + secretsSentinel + "';",
 	} {
 		if !strings.Contains(s, want) {
@@ -844,7 +855,7 @@ func TestAnAbsentAccessStillRestrictsToTheWorkAndResultDirectories(t *testing.T)
 	// the work directory alone when the result is inside it, written once
 	h2 := newHarness(t, "SELECT 1", r.env(nil))
 	h2.runTask()
-	if want := fmt.Sprintf("SET allowed_directories=['%s'];\n", h2.work); !strings.Contains(h2.script(), want) {
+	if want := fmt.Sprintf("SET allowed_directories=['%s'];\n", realDir(t, h2.work)); !strings.Contains(h2.script(), want) {
 		t.Errorf("the work directory is not alone in the list:\n%s", h2.script())
 	}
 }
@@ -1097,6 +1108,92 @@ func TestTheRestrictionIsNotWidenedByTheRunnersOwnDirectories(t *testing.T) {
 	h.cfg.bindingsFile = filepath.Join(h.work, "rl", "bindings.json")
 	if m, code, _ := h.exec(); code != 1 || m.ErrorClass != classInvalidQuery {
 		t.Errorf("a work directory holding the descriptor: metrics = %+v code %d", m, code)
+	}
+}
+
+// The runner's own directories are compared as the engine will resolve them: absolute and with their symlinks followed. A relative spelling or a link to a protected directory is the same
+// directory as the protected one, and a string comparison of the spelling alone would pass it.
+func TestARelativeOrLinkedWorkOrResultDirectoryIsHeldToTheSameOverlapRule(t *testing.T) {
+	r := newBindRig(t)
+	r.write(`{"v":1,"bindings":[]}`)
+	links := t.TempDir()
+	toRL := filepath.Join(links, "to_rl")
+	toSecrets := filepath.Join(links, "to_secrets")
+	if err := os.Symlink(r.rl, toRL); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(r.secretsDir(), toSecrets); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		cwd  string
+		env  map[string]string
+	}{
+		{"a work directory that is a link to the descriptor's directory", "", map[string]string{"RL_WORK_DIR": toRL}},
+		{"a work directory that is a link to the secrets directory", "", map[string]string{"RL_WORK_DIR": toSecrets}},
+		{"a result file in a link to the secrets directory", "", map[string]string{"RL_RESULT_FILE": filepath.Join(toSecrets, "result.parquet")}},
+		{"a result file in a directory that does not exist yet below a link", "", map[string]string{"RL_RESULT_FILE": filepath.Join(toSecrets, "new", "deeper", "result.parquet")}},
+		{"a relative work directory that is the descriptor's directory", r.rl, map[string]string{"RL_WORK_DIR": "."}},
+		{"a relative work directory that is the secrets directory", r.rl, map[string]string{"RL_WORK_DIR": "secrets"}},
+		{"a relative result file in the descriptor's directory", r.rl, map[string]string{"RL_RESULT_FILE": "result.parquet"}},
+		{"a relative result file in the secrets directory", r.rl, map[string]string{"RL_RESULT_FILE": "secrets/result.parquet"}},
+	}
+	for _, tc := range cases {
+		if tc.cwd != "" {
+			t.Chdir(tc.cwd)
+		}
+		h := newHarness(t, "SELECT 1", r.env(tc.env))
+		m, code, _ := h.exec()
+		if code != 1 || m.ErrorClass != classInvalidQuery {
+			t.Errorf("%s: metrics = %+v code %d, want invalid_query_file", tc.name, m, code)
+		}
+		if _, err := os.Stat(filepath.Join(h.work, "fake_script.sql")); err == nil {
+			t.Errorf("%s: the engine ran", tc.name)
+		}
+	}
+}
+
+// The list carries the resolved directory: the engine resolves both the entry and the path it opens, so the resolved spelling is the one that is compared and the one that is written.
+func TestTheAllowedListCarriesTheResolvedWorkAndResultDirectories(t *testing.T) {
+	r := newBindRig(t)
+	r.write(`{"v":1,"bindings":[]}`)
+	real1, real2 := t.TempDir(), t.TempDir()
+	links := t.TempDir()
+	if err := os.Symlink(real1, filepath.Join(links, "work")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real2, filepath.Join(links, "res")); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, "SELECT 1", r.env(map[string]string{"RL_WORK_DIR": filepath.Join(links, "work"), "RL_RESULT_FILE": filepath.Join(links, "res", "new", "result.parquet")}))
+	plan, class, err := prepareBindings(h.cfg)
+	if err != nil {
+		t.Fatalf("class %q: %v", class, err)
+	}
+	want := []string{realDir(t, real1), filepath.Join(realDir(t, real2), "new")}
+	if !reflect.DeepEqual(plan.allowed, want) {
+		t.Errorf("allowed = %q, want %q", plan.allowed, want)
+	}
+}
+
+// A directory the descriptor names may hold a single quote; the runner writes it as an SQL string literal, so the quote is doubled and ends nothing.
+func TestAnAccessDirectoryWithAQuoteIsAnSQLStringLiteralInTheAllowedList(t *testing.T) {
+	r := newBindRig(t)
+	for dir, lit := range map[string]string{
+		"/data/a'b/":       `'/data/a''b/'`,
+		"/data/q'];SELECT": `'/data/q''];SELECT/'`,
+		"/data/''/":        `'/data/''''/'`,
+	} {
+		r.write(accessDoc([]string{dir}, nil))
+		h := newHarness(t, "SELECT 1", r.env(nil))
+		plan, class, err := prepareBindings(h.cfg)
+		if err != nil {
+			t.Fatalf("%q: class %q: %v", dir, class, err)
+		}
+		if sql := plan.restrictionSQL(); !strings.Contains(sql, ", "+lit+"];\n") {
+			t.Errorf("%q: restriction = %q, want the entry written as %s", dir, sql, lit)
+		}
 	}
 }
 

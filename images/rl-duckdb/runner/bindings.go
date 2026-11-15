@@ -85,8 +85,9 @@ var (
 	reBindingName = regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*$`)
 	// reBindingUser is the plane's reSourceUser.
 	reBindingUser = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.$-]{0,62}$`)
-	// reURLPrefix: an object store only, scheme, one authority and a path of plain segments, ending in a slash.
-	reURLPrefix = regexp.MustCompile(`^(s3|gs|abfss)://[A-Za-z0-9][A-Za-z0-9._@-]{0,254}(/[A-Za-z0-9._=-]+)*/$`)
+	// reURLPrefix: an object store only, s3 and gs, scheme, one authority and a path of plain segments, ending in a slash. An abfss prefix waits for a measurement on the image's engine with its extension: the
+	// pinned engine read one as a directory relative to the working directory.
+	reURLPrefix = regexp.MustCompile(`^(s3|gs)://[A-Za-z0-9][A-Za-z0-9._@-]{0,254}(/[A-Za-z0-9._=-]+)*/$`)
 	// reLoopbackPrefix is the one http origin the proof vehicle may be given, and only with RL_BINDINGS_PROOF=1: the loopback stub the real-engine tests start.
 	reLoopbackOrigin = regexp.MustCompile(`^http://127\.0\.0\.1:([1-9][0-9]{0,4})/$`)
 	reHTTPSScope     = regexp.MustCompile(`^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:([1-9][0-9]{0,4}))?/$`)
@@ -238,6 +239,31 @@ func withResolved(p string) []string {
 		out = append(out, r)
 	}
 	return out
+}
+
+// ownDirSpellings is a directory the runner itself opens, absolute and cleaned, followed by the same directory with its symlinks resolved (the last element is the resolved one, and is
+// the only element when nothing differs). A directory that does not exist yet is resolved through its nearest existing ancestor, so a result directory the engine creates is still held
+// to where it will be.
+func ownDirSpellings(dir string) ([]string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := []string{abs}
+	rest := ""
+	for cur := abs; ; cur = filepath.Dir(cur) {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			if res := filepath.Join(r, rest); res != abs {
+				out = append(out, res)
+			}
+			break
+		}
+		if filepath.Dir(cur) == cur {
+			break
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+	}
+	return out, nil
 }
 
 // overlaps says whether the directory d (cleaned, with a trailing slash) is equal to, above or below the secrets directory, is a prefix of a protected file's path (so / and /run/rl/ are
@@ -634,12 +660,21 @@ func prepareBindings(c config) (*bindingsPlan, string, error) {
 	if err != nil {
 		return nil, classInvalidQuery, fmt.Errorf("bindings descriptor: %v", err)
 	}
-	// The runner's own directories come first, and they too must not reach a protected file: a result file at the root would put / in the list.
-	work := filepath.Clean(c.workDir)
-	for _, own := range []string{work, filepath.Dir(c.resultFile)} {
-		if prot.overlaps(strings.TrimRight(filepath.Clean(own), "/") + "/") {
-			return nil, classInvalidQuery, errors.New("bindings descriptor: the work or result directory overlaps a file the runner protects")
+	// The runner's own directories come first, and they too must not reach a protected file: a result file at the root would put / in the list. Each is made absolute and
+	// symlink-resolved FIRST, because the engine resolves both an allowed directory and the path it is asked to open: a relative spelling, or a link to the descriptor's directory, would
+	// pass a comparison of strings and still name the protected directory. Both spellings are checked, and the resolved one is what the list carries.
+	var own []string
+	for _, dir := range []string{c.workDir, filepath.Dir(c.resultFile)} {
+		spellings, err := ownDirSpellings(dir)
+		if err != nil {
+			return nil, classInvalidQuery, errors.New("bindings descriptor: the work or result directory cannot be made absolute")
 		}
+		for _, sp := range spellings {
+			if prot.overlaps(strings.TrimRight(sp, "/") + "/") {
+				return nil, classInvalidQuery, errors.New("bindings descriptor: the work or result directory overlaps a file the runner protects")
+			}
+		}
+		own = append(own, spellings[len(spellings)-1])
 	}
 	add := func(s string) {
 		for _, have := range p.allowed {
@@ -649,8 +684,9 @@ func prepareBindings(c config) (*bindingsPlan, string, error) {
 		}
 		p.allowed = append(p.allowed, s)
 	}
-	add(work)
-	add(filepath.Clean(filepath.Dir(c.resultFile)))
+	for _, s := range own {
+		add(s)
+	}
 	for _, s := range d.dirs {
 		add(s)
 	}
