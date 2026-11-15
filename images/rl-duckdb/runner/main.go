@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -87,6 +88,10 @@ const (
 	classIO         = "io_error"
 	classHTTP       = "http_error"
 	classPermission = "permission_denied"
+
+	// classBindingRefused: a binding the plane described could not be made into an engine secret: its type is one this runner cannot make, its value is one it will not use (bindings.go
+	// names the rules), or the engine refused the secret's statement. The note names the rule and the binding's own name and nothing of what the file or the descriptor held.
+	classBindingRefused = "binding_refused"
 )
 
 // classPrelude: the engine ran init, then failed inside the prelude the control plane
@@ -152,6 +157,8 @@ type metrics struct {
 	probe *probeFacts
 	// task is the claim a task makes of its write, printed as its own RL_TASK line directly before this one (emit). Never part of the metrics line.
 	task *taskLine
+	// bindings is what a run with a bindings descriptor did, printed as its own RL_BINDINGS line directly before the RL_TASK or RL_METRICS line (emit). Never part of the metrics line.
+	bindings *bindingsAck
 }
 
 type config struct {
@@ -189,6 +196,12 @@ type config struct {
 	// catalogTokenFile names the file the agent put the catalog token in, or is empty. The runner makes the iceberg secret from it (task.go); the token is held only here.
 	catalogTokenFile string
 	catalogToken     string
+	// bindingsFile (RL_BINDINGS_FILE), when set, is the descriptor of bindings.go: the secrets to make from the files beside it, and the files and URL prefixes the engine may keep reading. Setting it
+	// is what restricts the engine's files; empty is every run before this existed. bindingsProof (RL_BINDINGS_PROOF=1) is the runner's own word, which no production path sets, that the http
+	// bearer type, the proof vehicle, may be made. bindings is the descriptor once run() has read and checked it.
+	bindingsFile  string
+	bindingsProof bool
+	bindings      *bindingsPlan
 }
 
 var (
@@ -216,6 +229,14 @@ func configFromEnv(getenv func(string) string) (config, error) {
 	c.probeFile = strings.TrimSpace(getenv("RL_PROBE_FILE"))
 	c.taskFile = strings.TrimSpace(getenv("RL_TASK_FILE"))
 	c.catalogTokenFile = strings.TrimSpace(getenv("RL_CATALOG_TOKEN_FILE"))
+	c.bindingsFile = strings.TrimSpace(getenv("RL_BINDINGS_FILE"))
+	switch v := strings.TrimSpace(getenv("RL_BINDINGS_PROOF")); v {
+	case "":
+	case "1":
+		c.bindingsProof = true
+	default:
+		return c, fmt.Errorf("RL_BINDINGS_PROOF must be 1 or empty, got %q", v)
+	}
 	c.resultFile = or(getenv("RL_RESULT_FILE"), filepath.Join(c.workDir, "result.parquet"))
 	switch v := strings.TrimSpace(getenv("RL_MEASURE_BYTES")); v {
 	case "":
@@ -288,6 +309,12 @@ func emit(w io.Writer, m metrics) {
 	if m.probe != nil {
 		if pb, err := json.Marshal(m.probe); err == nil {
 			fmt.Fprintf(w, "RL_PROBE %s\n", pb)
+		}
+	}
+	// WHAT A BINDINGS DESCRIPTOR DID, directly before the task's claim or the metrics line: which secrets the engine made and whether its files were restricted, both from the sentinels it printed.
+	if m.bindings != nil {
+		if bb, err := json.Marshal(m.bindings); err == nil {
+			fmt.Fprintf(w, "RL_BINDINGS %s\n", bb)
 		}
 	}
 	// A TASK'S CLAIM, directly before the metrics line (the agent reads exactly one RL_TASK line, and it must be the line before the last RL_METRICS).
@@ -387,6 +414,30 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 		}
 		cfg.catalogToken = tok
 	}
+	// A BINDINGS DESCRIPTOR IS REFUSED, NEVER RUN AS IF IT WERE ABSENT (bindings.go). The modes whose behaviour under the file restriction is unmeasured refuse it before the engine starts: a probe, a
+	// bare statement (rows_out 0 and a script this runner does not shape) and the engine's read log (enabled before the lock and read back from a file). A plain query, a query that returns
+	// rows, a task and a DESCRIBE accept it. Then the descriptor is read and checked, its types are held to what this runner can make, and its values are read: every fault is a refusal
+	// before the engine, the descriptor's the plane's class and a type's or a value's the binding class.
+	if cfg.bindingsFile != "" {
+		switch {
+		case cfg.probeFile != "":
+			note("a probe has no bindings")
+			return finish(classInvalidQuery, 1)
+		case kind == kindStatement:
+			note("bindings are not made for a statement that returns no rows")
+			return finish(classInvalidQuery, 1)
+		case cfg.measureBytes:
+			note("bindings are not made while measuring bytes")
+			return finish(classInvalidQuery, 1)
+		}
+		plan, class, err := prepareBindings(cfg)
+		if err != nil {
+			note("%v", err)
+			return finish(class, 1)
+		}
+		cfg.bindings = plan
+		m.bindings = &bindingsAck{V: bindingsSpecVersion, Made: []string{}}
+	}
 	initSQL, err := os.ReadFile(cfg.initFile)
 	if err != nil {
 		note("init file: %v", err)
@@ -415,7 +466,15 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 		}
 		cfg.taskTail = tail
 	}
-	script := composeScript(string(initSQL), prelude, cfg, tmpDir, countFile, bytesFile, stmt, kind)
+	script := composeScriptBytes(string(initSQL), prelude, cfg, tmpDir, countFile, bytesFile, stmt, kind)
+	if cfg.bindings != nil {
+		// WHATEVER HAPPENS NEXT, the values are zeroed and the logs are checked for them last (best effort: a copy in the allocator or in a pipe's buffer is not reachable from here).
+		outForBelt := filepath.Join(cfg.workDir, "duckdb.out")
+		defer func() {
+			cfg.bindings.beltScan(errorLog, outForBelt)
+			cfg.bindings.wipe()
+		}()
+	}
 
 	// The engine's stdout is captured to a file and never forwarded: a non-query
 	// statement can print rows, and the sentinel is read back from here.
@@ -435,7 +494,7 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	// -no-init: never read ~/.duckdbrc; HOME is the writable emptyDir.
 	// -csv -noheader: the only stdout we read back is the sentinel and it is one token.
 	cmd := exec.CommandContext(ctx, cfg.duckdb, "-batch", "-bail", "-no-init", "-csv", "-noheader")
-	cmd.Stdin = strings.NewReader(script)
+	cmd.Stdin = bytes.NewReader(script)
 	cmd.Stdout = outf
 	cmd.Stderr = logf
 	// The engine gets a fresh, minimal environment. The pod carries no credential by
@@ -445,6 +504,22 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 	cmd.WaitDelay = 5 * time.Second
 	runErr := cmd.Run()
 	outf.Close()
+	// The script held the bindings' hex; nothing reads it again.
+	for i := range script {
+		script[i] = 0
+	}
+	// WHAT THE SENTINELS SAY ABOUT A RUN WITH A DESCRIPTOR. The ack is what the engine printed, not what the script meant to do. And when the engine ran init and never reached the secrets'
+	// sentinel (a failed CREATE SECRET, a kill, a timeout), error.log is REPLACED by the runner's own note: the engine's error quotes the statement, and the statement holds the
+	// value's hex. The engine's stderr is that file (cmd.Stderr), already closed to the child, and the runner's own notes append after it.
+	secretsMissing := false
+	if cfg.bindings != nil {
+		m.bindings = cfg.bindings.settle(outPath)
+		if m.bindings.Restricted && !sentinelRan(outPath, secretsSentinel) {
+			secretsMissing = true
+			_ = logf.Truncate(0)
+			fmt.Fprint(logf, cfg.bindings.scrubNote())
+		}
+	}
 	if cfg.task != nil {
 		// HOW THE ENGINE ENDED decides how far the sentinels can be believed: a process that returned flushed its stdout, one that was killed or timed out may not have.
 		exitedNormally := runErr == nil
@@ -485,6 +560,14 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 		if !initRan(outPath) {
 			note("the engine failed before the statement ran (configuration or extension load); its stderr is above")
 			return finish(classRunnerIO, 1)
+		}
+		if secretsMissing {
+			// The catalog token has its own sentinel with a descriptor, so a token that fails is not a binding's failure: a failed token statement keeps the class a bad token file has.
+			if cfg.catalogToken != "" && !sentinelRan(outPath, tokenSentinel) {
+				note("the engine refused the catalog token's secret")
+				return finish(classRunnerIO, 1)
+			}
+			return finish(classBindingRefused, 1)
 		}
 		if prelude != "" && !sentinelRan(outPath, preludeSentinel) {
 			note("the engine failed inside the control plane's prelude, before the statement ran; the sandbox may not reach the published dataset. Its stderr is above")
@@ -574,7 +657,16 @@ func run(ctx context.Context, cfg config) (metrics, int) {
 // composeScript is the whole conversation with the engine, in order: the image's
 // init.sql, the per-run settings, the lock, the sentinel, then the statement.
 func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, bytesFile, stmt string, kind stmtKind) string {
-	var b strings.Builder
+	return string(composeScriptBytes(initSQL, prelude, cfg, tmpDir, countFile, bytesFile, stmt, kind))
+}
+
+// composeScriptBytes is composeScript as the bytes the engine is fed. With a bindings descriptor they hold the values' hex, so the runner keeps them as bytes it can zero rather than as a string.
+func composeScriptBytes(initSQL, prelude string, cfg config, tmpDir, countFile, bytesFile, stmt string, kind stmtKind) []byte {
+	var b bytes.Buffer
+	b.Grow(len(initSQL) + len(prelude) + len(stmt) + 4096)
+	if cfg.bindings != nil {
+		b.Grow(2*maxBindingValuesBytes + 1024)
+	}
 	b.WriteString(initSQL)
 	if !strings.HasSuffix(initSQL, "\n") {
 		b.WriteByte('\n')
@@ -594,6 +686,11 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, bytes
 	if cfg.measureBytes {
 		b.WriteString(enableReadLogSQL)
 	}
+	// THE FILE RESTRICTION, only when a bindings descriptor is present (bindings.go), in the order measured on the pinned engine and BEFORE the lock, which forbids all three after it: no persistent
+	// secret, then the allowed directories, then no external access (the other order fails init, and the second setting alone shuts the work directory too).
+	if cfg.bindings != nil {
+		b.WriteString(cfg.bindings.restrictionSQL())
+	}
 	// From here the statement cannot re-enable autoinstall, move the extension
 	// directory, or change any other setting: DuckDB refuses with an error.
 	b.WriteString("SET lock_configuration=true;\n")
@@ -602,6 +699,15 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, bytes
 	// engine's stdin and nowhere else (task.go).
 	if cfg.catalogToken != "" {
 		b.WriteString(secretSQL(cfg.catalogToken))
+		// With a descriptor the token has its own sentinel, so a token that fails is told apart from a binding that does.
+		if cfg.bindings != nil {
+			fmt.Fprintf(&b, "SELECT '%s';\n", tokenSentinel)
+		}
+	}
+	// THE BINDINGS' SECRETS, in the token's slot: after the lock and the init sentinel (a CREATE SECRET after the lock was measured to work), each the value's hex and never its bytes, and
+	// followed by their own sentinel, so a secret that fails is a binding's failure and not the statement's.
+	if cfg.bindings != nil {
+		cfg.bindings.writeSecrets(&b)
 	}
 	// THE PRELUDE, AFTER THE LOCK AND AFTER THE INIT SENTINEL. After the lock, so even a
 	// prelude cannot re-enable autoinstall or move the extension directory; after the
@@ -641,7 +747,7 @@ func composeScript(initSQL, prelude string, cfg config, tmpDir, countFile, bytes
 		b.WriteString(copyResultSQL(cfg.resultFile, filepath.Join(tmpDir, copyScript)))
 		fmt.Fprintf(&b, "COPY (SELECT count(*) FROM %s) TO %s (FORMAT CSV, HEADER false);\n", resultTable, sqlString(countFile))
 	}
-	return b.String()
+	return b.Bytes()
 }
 
 // WHERE bytes_scanned COMES FROM, AND WHY IT IS OFF UNLESS ASKED (tracker 8.14.103, measured 2026-10-24 on the pinned 1.5.5 CLI).

@@ -446,6 +446,11 @@ func TestTheOutcomeIsTheWordOfHowFarTheWriteGot(t *testing.T) {
 // THE FAKE ENGINE'S TASK MODES: how the runner reads an engine that stops somewhere.
 func fakeTaskEngine(mode string, script string, home string) int {
 	fmt.Println(initSentinel)
+	for _, w := range []string{tokenSentinel, secretsSentinel} {
+		if strings.Contains(script, "SELECT '"+w+"';") {
+			fmt.Println(w)
+		}
+	}
 	if strings.Contains(script, "SELECT '"+preludeSentinel+"';") {
 		fmt.Println(preludeSentinel)
 	}
