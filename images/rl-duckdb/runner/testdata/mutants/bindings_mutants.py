@@ -30,7 +30,7 @@ mut("M03", "the two settings in the wrong order", (B, '''"SET allowed_directorie
 mut("M04", "external access off and no allowed directories", (B, '''"SET allowed_directories=[" + strings.Join(quoted, ", ") + "];\\n" +''', '''""+'''))
 mut("M05", "persistent secrets left on", (B, '''return "SET allow_persistent_secrets=false;\\n" +''', '''return ""+'''))
 mut("M06", "an absent access is no restriction", (B, "func (p *bindingsPlan) restrictionSQL() string {\n", "func (p *bindingsPlan) restrictionSQL() string {\n\tif len(p.desc.dirs) == 0 && len(p.desc.prefixes) == 0 {\n\t\treturn \"\"\n\t}\n"))
-mut("M07", "the work directory left out of the allowed list", (B, "\tadd(work)\n", ""))
+mut("M07", "the work directory left out of the allowed list", (B, "\tfor _, s := range own {\n\t\tadd(s)\n\t}\n", "\tfor _, s := range own[1:] {\n\t\tadd(s)\n\t}\n"))
 mut("M08", "the descriptor's own directories left out", (B, "\tfor _, s := range d.dirs {\n\t\tadd(s)\n\t}\n", ""))
 
 # ---- the value -----------------------------------------------------------------------------------------------------------------------------------------------
@@ -49,7 +49,7 @@ mut("M18", "a directory not given its slash", (B, '''return "/" + strings.Join(s
 mut("M19", "a .. segment accepted", (B, 's == "" || s == "." || s == ".."', 's == "" || s == "."'))
 mut("M20", "symlinks of a protected path not resolved", (B, "if r, err := filepath.EvalSymlinks(p); err == nil && r != p {", "if r, err := filepath.EvalSymlinks(p); false && err == nil && r != p {"))
 mut("M21", "a symlinked entry not resolved", (B, "if r, err := filepath.EvalSymlinks(dir); err == nil && prot.overlaps", "if r, err := filepath.EvalSymlinks(dir); false && err == nil && prot.overlaps"))
-mut("M22", "an https url prefix accepted", (B, "(s3|gs|abfss)://", "(s3|gs|abfss|https?)://"))
+mut("M22", "an https url prefix accepted", (B, "(s3|gs)://", "(s3|gs|https?)://"))
 mut("M23", "the loopback prefix accepted without the proof word", (B, "\tif proof {\n\t\tif m := reLoopbackOrigin", "\tif true {\n\t\tif m := reLoopbackOrigin"))
 mut("M24", "http_proxy optional", (B, "if b.HTTPProxy == nil || !proxyOK(*b.HTTPProxy) {", "if b.HTTPProxy != nil && !proxyOK(*b.HTTPProxy) {"))
 mut("M25", "duplicate keys accepted", (B, "\t\t\t\tif seen[key] {\n", "\t\t\t\tif false && seen[key] {\n"))
@@ -58,7 +58,7 @@ mut("M27", "a port written as text accepted", (B, "rePortText       = regexp.Mus
     (B, "\tn, err := strconv.Atoi(s)\n", "\tn, err := strconv.Atoi(strings.Trim(s, \"\\\"\"))\n"))
 mut("M28", "catalog_token accepted as a binding name", (B, ' || b.Binding == "catalog_token"', ""))
 mut("M29", "the descriptor's size cap off", (B, "len(buf) > maxBindingsFileBytes {", "len(buf) > 10*maxBindingsFileBytes {"))
-mut("M30", "the work and result directories not held to the overlap check", (B, '\t\tif prot.overlaps(strings.TrimRight(filepath.Clean(own), "/") + "/") {', '\t\tif false && prot.overlaps(strings.TrimRight(filepath.Clean(own), "/") + "/") {'))
+mut("M30", "the work and result directories not held to the overlap check", (B, '\t\t\tif prot.overlaps(strings.TrimRight(sp, "/") + "/") {', '\t\t\tif false && prot.overlaps(strings.TrimRight(sp, "/") + "/") {'))
 mut("M31", "a postgres host accepts an underscore", (B, "\t\tok := hostOK(*b.Host)\n", "\t\tok := mysqlHostOK(*b.Host)\n"))
 mut("M32", "the database's address syntax accepted", (B, 'strings.ContainsAny(d, "?&#/%;+ ")', 'strings.ContainsAny(d, "")'))
 mut("M33", "an empty user accepted", (B, "if !reBindingUser.MatchString(*b.User) {", "if false && !reBindingUser.MatchString(*b.User) {"))
@@ -103,6 +103,15 @@ mut("M48", "the belt dropped", (B, "func (p *bindingsPlan) beltScan(errorLog, ou
 mut("M49", "the values not zeroed", (B, "\t\t\tv.value[i] = 0\n", "\t\t\t_ = i\n"))
 mut("M50", "the secrets statements dropped", (B, "\t\trenderBinding(b, d, p.values[i].value)\n", "\t\t_, _ = d, i\n"))
 
+# ---- the runner's own directories, quotes in entries, the object-store schemes ---------------------------------------------------------------------------------
+mut("M51", "the work and result directories compared as written, not resolved", (B, "\t	for _, sp := range spellings {\n", "\t	for _, sp := range spellings[:1] {\n"))
+mut("M52", "the allowed list carries the unresolved spelling", (B, "own = append(own, spellings[len(spellings)-1])", "own = append(own, spellings[0])"))
+mut("M53", "a directory that does not exist yet is not resolved through its ancestor", (B, "\t	if filepath.Dir(cur) == cur {\n\t\t\tbreak\n\t\t}\n", "\t\tbreak\n"))
+mut("M54", "an allowed directory written without doubling its quote", (B, "\t	quoted[i] = sqlString(a)\n", "\t	quoted[i] = \"'\" + a + \"'\"\n"))
+mut("M55", "an abfss prefix accepted", (B, "(s3|gs)://", "(s3|gs|abfss)://"))
+mut("M56", "the work directory not made absolute", (B, "\tabs, err := filepath.Abs(dir)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tout := []string{abs}", "\tabs, err := filepath.Clean(dir), error(nil)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tout := []string{abs}"))
+mut("M57", "the result directory left out of the overlap check", (B, "[]string{c.workDir, filepath.Dir(c.resultFile)} {\n\t	spellings", "[]string{c.workDir} {\n\t	spellings"))
+mut("M58", "the resolved spelling not added to the checked ones", (B, "res != abs {", "res != abs && false {"))
 
 def run(args):
     ids = set(args)
