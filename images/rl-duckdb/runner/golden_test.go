@@ -10,8 +10,8 @@ import (
 //
 // Every file in testdata/golden is the output of composeScript at cbcb7ae6 (the commit before the bindings descriptor existed), written by the unmodified function from the
 // inputs below and the image's init.sql of that commit (testdata/golden/init.sql, a copy). A run with no RL_BINDINGS_FILE must compose these bytes exactly, for every mode
-// the runner has: the first five are the ones docs/measurements/2026-11-14-runner-file-access/golden holds (the control plane's measurement of the same function), the
-// rest are the task, probe and byte-measuring shapes that measurement did not reproduce.
+// the runner has: the first five match the copies the control plane keeps of the same function, the
+// rest are the task, probe and byte-measuring shapes the control plane's copies do not hold.
 //
 // To regenerate (ONLY from a commit whose composeScript is the one being frozen): RL_GOLDEN_WRITE=1 go test -run TestTheScriptWithNoDescriptorIsTheFrozenOne.
 func goldenCases() []struct {

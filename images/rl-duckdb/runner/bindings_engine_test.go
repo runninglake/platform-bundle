@@ -128,17 +128,23 @@ func TestTheRealEngineOpensOnlyWhatItIsNamedOnceADescriptorIsPresent(t *testing.
 			t.Errorf("%s: ack = %q", name, lines[0])
 		}
 	}
-	// THE CONTROL: the same statements with no descriptor are not restricted, so the refusals above are the restriction's and not the statements'.
-	for name, sql := range map[string]string{
-		"read_text": "SELECT content FROM read_text(" + sqlString(canaryFile) + ")",
-		"outside":   "SELECT content FROM read_text(" + sqlString(filepath.Join(outside, "data.txt")) + ")",
+	// THE CONTROL: the same statement shapes with no descriptor run as they always did, so the refusals above are the restriction's and not the statements'. The fixtures are in a
+	// directory of their own.
+	fixtures := t.TempDir()
+	plainFile := filepath.Join(fixtures, "plain_file")
+	if err := os.WriteFile(plainFile, []byte(canaryText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ sql, want string }{
+		"a fixture":      {"SELECT content FROM read_text(" + sqlString(plainFile) + ")", canaryText},
+		"outside a list": {"SELECT content FROM read_text(" + sqlString(filepath.Join(outside, "data.txt")) + ")", "outside-data"},
 	} {
-		m, code, _, h := e.run(t, nil, sql, nil)
+		m, code, _, h := e.run(t, nil, tc.sql, nil)
 		if code != 0 || m.Status != "succeeded" {
 			t.Fatalf("control %s: metrics = %+v code %d\n%s", name, m, code, h.errorLog())
 		}
-		if got := e.resultOf(t, h, "content"); !strings.Contains(got, canaryText) && !strings.Contains(got, "outside-data") {
-			t.Errorf("control %s: the run with no descriptor did not open the file (%q)", name, got)
+		if got := e.resultOf(t, h, "content"); !strings.Contains(got, tc.want) {
+			t.Errorf("control %s: result = %q, want it to hold %q", name, got, tc.want)
 		}
 	}
 }
@@ -203,6 +209,60 @@ func TestTheRealEngineStillWritesTheResultCountsTheRowsAndReadsWhatTheDescriptor
 	m, code, _, h = e.run(t, r, "SELECT i, md5(i::VARCHAR) AS h FROM range(4000000) t(i) ORDER BY h", map[string]string{"RL_MEMORY_LIMIT": "128MB"})
 	if code != 0 || m.RowsOut != 4000000 {
 		t.Errorf("a spilling sort under the restriction: metrics = %+v code %d\n%s", m, code, h.errorLog())
+	}
+}
+
+// A work or result directory that is a link to a protected directory is refused before the engine runs, and one that is a link to an ordinary directory runs and writes its result: the
+// engine resolves the entry and the path it opens, and the list carries the resolved directory.
+func TestTheRealEngineRunsWithALinkedWorkDirectoryOnlyWhenItLeadsNowhereProtected(t *testing.T) {
+	e := pinnedEngine(t)
+	r := newBindRig(t)
+	r.write(`{"v":1,"bindings":[]}`)
+	links := t.TempDir()
+	toRL := filepath.Join(links, "to_rl")
+	if err := os.Symlink(r.rl, toRL); err != nil {
+		t.Fatal(err)
+	}
+	m, code, _, h := e.run(t, r, "SELECT 1", map[string]string{"RL_WORK_DIR": toRL})
+	if code != 1 || m.ErrorClass != classInvalidQuery {
+		t.Errorf("a work directory that is a link to the descriptor's directory: metrics = %+v code %d", m, code)
+	}
+	if _, err := os.Stat(filepath.Join(h.work, "duckdb.out")); err == nil {
+		t.Error("the engine was started")
+	}
+	realWork := t.TempDir()
+	linkWork := filepath.Join(links, "work")
+	if err := os.Symlink(realWork, linkWork); err != nil {
+		t.Fatal(err)
+	}
+	m, code, _, h = e.run(t, r, "SELECT i FROM range(3) t(i)", map[string]string{"RL_WORK_DIR": linkWork, "RL_RESULT_FILE": filepath.Join(linkWork, "result.parquet")})
+	if code != 0 || m.Status != "succeeded" || m.RowsOut != 3 {
+		t.Fatalf("a work directory that is a link to an ordinary directory: metrics = %+v code %d\n%s", m, code, h.errorLog())
+	}
+	if got := duckSQL(t, e.bin, "SELECT count(*) FROM read_parquet("+sqlString(filepath.Join(realWork, "result.parquet"))+")"); got != "3" {
+		t.Errorf("rows in the result = %q, want 3", got)
+	}
+}
+
+// A single quote in a directory the descriptor names is an SQL string literal's quote, doubled: the directory is read, and an entry that looks like the end of the list is only an
+// unusual directory name.
+func TestTheRealEngineTakesAQuoteInAnAccessDirectoryAsPartOfItsName(t *testing.T) {
+	e := pinnedEngine(t)
+	r := newBindRig(t)
+	quoted := filepath.Join(t.TempDir(), "it's")
+	if err := os.MkdirAll(quoted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(quoted, "rows.csv"), []byte("a\n4\n5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r.write(fmt.Sprintf(`{"v":1,"access":{"directories":[%s,"/no/such/q'];SELECT"]},"bindings":[]}`, jq(quoted)))
+	m, code, lines, h := e.run(t, r, "SELECT sum(a) AS s FROM read_csv("+sqlString(filepath.Join(quoted, "rows.csv"))+")", nil)
+	if code != 0 || m.Status != "succeeded" || e.resultOf(t, h, "s") != "9" {
+		t.Fatalf("metrics = %+v code %d\n%s", m, code, h.errorLog())
+	}
+	if lines[0] != `RL_BINDINGS {"v":1,"made":[],"restricted":true}` {
+		t.Errorf("ack = %q", lines[0])
 	}
 }
 
@@ -528,8 +588,8 @@ func TestTheRealEngineRefusesAMissingOrEmptyValueFileBeforeItRuns(t *testing.T) 
 	}
 }
 
-// What a customer's statement can do about the loopback in a descriptor-less run is not changed by any of the above: the same statement, no descriptor, is the old behaviour.
-func TestTheRealEngineRunsAPlainQueryWithNoDescriptorUnrestricted(t *testing.T) {
+// A run with no descriptor keeps the script this runner always wrote: the same plain query runs and writes its result.
+func TestTheRealEngineKeepsTheOldScriptForARunWithNoDescriptor(t *testing.T) {
 	e := pinnedEngine(t)
 	data := t.TempDir()
 	if err := os.WriteFile(filepath.Join(data, "f.csv"), []byte("a\n5\n"), 0o644); err != nil {
