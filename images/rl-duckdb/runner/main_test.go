@@ -50,12 +50,26 @@ func fakeDuckDB() int {
 		}
 		fmt.Println(initSentinel)
 	}
+	// With a bindings descriptor the script carries two more sentinels, which the engine prints when it gets to them (bindings_test.go's modes stop before one).
+	bindingSentinels := func(upTo string) {
+		for _, w := range []string{tokenSentinel, secretsSentinel} {
+			if w == upTo {
+				return
+			}
+			if strings.Contains(string(script), "SELECT '"+w+"';") {
+				fmt.Println(w)
+			}
+		}
+	}
 	// The engine executes the prelude's sentinel SELECT like any other; the fake echoes
 	// it whenever the script carries it, except in the mode that fails inside the prelude.
 	preludeSentinelIfPresent := func() {
 		if strings.Contains(string(script), "SELECT '"+preludeSentinel+"';") {
 			fmt.Println(preludeSentinel)
 		}
+	}
+	if handled, code := fakeBindingsMode(mode, string(script), sentinel, bindingSentinels); handled {
+		return code
 	}
 	switch mode {
 	case "prelude_error":
@@ -64,6 +78,7 @@ func fakeDuckDB() int {
 		return 1
 	case "sql_error":
 		sentinel()
+		bindingSentinels("")
 		preludeSentinelIfPresent()
 		fmt.Fprintf(os.Stderr, "Catalog Error: Table with name %s does not exist!\nLINE 1: SELECT secret_column FROM %s\n", canary, canary)
 		return 1
@@ -85,6 +100,7 @@ func fakeDuckDB() int {
 	}
 	// Success: honour the COPY targets the runner wrote into the script.
 	sentinel()
+	bindingSentinels("")
 	preludeSentinelIfPresent()
 	s := string(script)
 	rows := "1"
